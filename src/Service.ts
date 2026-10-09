@@ -36,6 +36,9 @@ import type { Providers } from "./Providers.ts";
 export const DEFAULT_SERVICE_BASE_IMAGE = "node:24-slim";
 export const DEFAULT_SERVICE_PORT = 8080;
 export const SERVICE_PLATFORM = "linux/amd64";
+
+/** This package's own SSH scanner dependency; never loaded by a hosted program. */
+const SERVICE_DEFAULT_EXTERNALS = ["ssh2", "cpu-features"];
 /**
  * Alchemy only lets a generated entry import `alchemy/*`. Its Node bootstraps for
  * container hosts are identical apart from the log label; this one serves the
@@ -273,6 +276,7 @@ const makeServiceBundler = Effect.gen(function* () {
         cwd,
         platform: "node",
         external: (moduleId, parentId, isResolvedId) =>
+          SERVICE_DEFAULT_EXTERNALS.some((root) => matchesPackageRoot(moduleId, root)) ||
           installRoots.some((root) => matchesPackageRoot(moduleId, root)) ||
           matchesExternal(configuredExternal, moduleId, parentId, isResolvedId),
         resolve: {
