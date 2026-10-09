@@ -25,6 +25,7 @@ import { PrivateNic, PrivateNicProvider } from "./PrivateNic.ts";
 import { PrivateNetwork, PrivateNetworkProvider } from "./PrivateNetwork.ts";
 import { Project, ProjectProvider } from "./Project.ts";
 import { RegistryNamespace, RegistryNamespaceProvider } from "./RegistryNamespace.ts";
+import { Service, ServiceProvider } from "./Service.ts";
 import { Secret, SecretProvider } from "./Secret.ts";
 import { SecurityGroup, SecurityGroupProvider } from "./SecurityGroup.ts";
 import { Trigger, TriggerProvider } from "./Trigger.ts";
@@ -73,6 +74,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
       FlexibleIp,
       InstanceKnownHosts,
       PrivateNic,
+      Service,
     ]),
   ).pipe(
     Layer.provide(
@@ -104,6 +106,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
         FlexibleIpProvider(),
         InstanceKnownHostsProvider(),
         PrivateNicProvider(),
+        ServiceProvider(),
       ),
     ),
     Layer.provide(ScalewayClientsLive),

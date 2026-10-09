@@ -4,6 +4,12 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 ## Unreleased
 
+### Added
+
+- `Service`: an Effect-native platform hosting a bundled program as a
+  Serverless Container, with init-time config and Outputs bound into its
+  (secret) environment, composed from `ContainerImage` and `Container`.
+
 ### Changed
 
 - The package now ships compiled JavaScript and declarations in `dist/`

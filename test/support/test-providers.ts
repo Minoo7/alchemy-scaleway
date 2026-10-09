@@ -29,6 +29,7 @@ import { PrivateNetwork, PrivateNetworkProvider } from "../../src/PrivateNetwork
 import { Project, ProjectProvider } from "../../src/Project.ts";
 import { Providers } from "../../src/Providers.ts";
 import { RegistryNamespace, RegistryNamespaceProvider } from "../../src/RegistryNamespace.ts";
+import { Service, ServiceProvider } from "../../src/Service.ts";
 import { Secret, SecretProvider } from "../../src/Secret.ts";
 import { SecurityGroup, SecurityGroupProvider } from "../../src/SecurityGroup.ts";
 import { Trigger, TriggerProvider } from "../../src/Trigger.ts";
@@ -79,6 +80,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
       SecurityGroup,
       FlexibleIp,
       PrivateNic,
+      Service,
     ]),
   ).pipe(
     Layer.provide(
@@ -110,6 +112,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
         SecurityGroupProvider(),
         FlexibleIpProvider(),
         PrivateNicProvider(),
+        ServiceProvider(),
       ),
     ),
     Layer.provide(ScalewayClientsLive),

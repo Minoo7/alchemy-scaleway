@@ -217,3 +217,16 @@ export {
   type VpcRouteProps,
   type VpcRouteVpcRef,
 } from "./VpcRoute.ts";
+export {
+  DEFAULT_SERVICE_BASE_IMAGE,
+  DEFAULT_SERVICE_PORT,
+  generateServiceDockerfile,
+  Service,
+  ServiceProvider,
+  splitServiceEnvironment,
+  type ServiceBuildOptions,
+  type ServiceProps,
+  type ServiceRuntimeContext,
+  type ServiceServices,
+  type ServiceShape,
+} from "./Service.ts";
