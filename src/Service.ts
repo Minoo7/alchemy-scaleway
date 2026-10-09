@@ -51,11 +51,18 @@ export interface ServiceBuildOptions extends Bundle.BundleConfig {
   readonly install?: PackageInstall;
 }
 
+/**
+ * A resource-valued prop: the value itself, or an Effect producing it, so a
+ * module-scope `Scaleway.Namespace(...)` can be passed without yielding it.
+ * Effects are resolved at plan time only; the deployed program never runs them.
+ */
+export type ServiceRef<T> = T | Effect.Effect<T, never, Providers>;
+
 export interface ServiceProps extends PlatformProps {
   /** Serverless Containers namespace the service runs in. */
-  namespace: NamedNamespace;
+  namespace: ServiceRef<NamedNamespace>;
   /** Container Registry namespace (or `rg.<region>.scw.cloud/<namespace>` prefix) the image is pushed to. */
-  registry: ContainerImageRegistryRef;
+  registry: ServiceRef<ContainerImageRegistryRef>;
   /** Module bundled with rolldown into the image, typically `import.meta.url`. */
   main: string;
   /** Named export loaded from `main`. @default "default" */
@@ -66,7 +73,11 @@ export interface ServiceProps extends PlatformProps {
   repository?: string;
   /** Port the bundled HTTP server listens on. @default 8080 */
   port?: number;
-  /** Extra environment. `Redacted` values become secret environment variables. */
+  /**
+   * Extra environment. `Redacted` values become secret environment variables.
+   * Values may be Effects (for example an Output built from another resource),
+   * resolved at plan time like `namespace` and `registry`.
+   */
   env?: Record<string, any>;
   build?: ServiceBuildOptions;
   /** Files or directories copied into `/app` next to the bundle, hashed into the image. */
@@ -121,12 +132,41 @@ export type ServiceRuntimeContext = HostRuntimeContext;
  *
  * @resource
  */
+const resolveRef = <T>(value: ServiceRef<T>) =>
+  Effect.isEffect(value) ? (value as Effect.Effect<T, never, Providers>) : Effect.succeed(value);
+
 export const Service: Platform<Service, ServiceServices, ServiceShape, ServiceRuntimeContext> = Platform(
   "Scaleway.Service",
   {
     createRuntimeContext: createContainerRuntimeContext("Scaleway.Service"),
+    transformProps: (_id, props: ServiceProps) =>
+      Effect.gen(function* () {
+        if (globalThis.__ALCHEMY_RUNTIME__) return props;
+        const env =
+          props.env === undefined
+            ? undefined
+            : Object.fromEntries(
+                yield* Effect.forEach(Object.entries(props.env), ([key, value]) =>
+                  resolveRef(value).pipe(Effect.map((resolved) => [key, resolved] as const)),
+                ),
+              );
+        return {
+          ...props,
+          namespace: yield* resolveRef(props.namespace),
+          registry: yield* resolveRef(props.registry),
+          env,
+        };
+      }),
   },
 );
+
+class UnresolvedServiceProp extends Error {}
+
+/** Props reach the provider after `transformProps`; an Effect here is a defect. */
+const resolved = <T>(value: ServiceRef<T>, name: string): T => {
+  if (Effect.isEffect(value)) throw new UnresolvedServiceProp(`Scaleway.Service ${name} was not resolved at plan time`);
+  return value as T;
+};
 
 const REDACTED_MARKER = '{"_tag":"Redacted"';
 
@@ -306,7 +346,7 @@ const containerPropsOf = (
     PORT: String(port),
   });
   return {
-    namespace: props.namespace,
+    namespace: resolved(props.namespace, "namespace"),
     name: props.name,
     description: props.description,
     image: image.ref,
@@ -342,7 +382,7 @@ const serviceProvider = () =>
       };
       const imageId = (id: string) => `${id}Image`;
       const imageProps = (id: string, props: ServiceProps, context: string) => ({
-        registry: props.registry,
+        registry: resolved(props.registry, "registry"),
         context,
         repository: props.repository ?? id.toLowerCase(),
         tag: "service",

@@ -5,6 +5,7 @@ import * as Redacted from "effect/Redacted";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import * as Output from "alchemy/Output";
 import * as Test from "alchemy/Test/Bun";
 import * as Scaleway from "../src/index.ts";
 import { installScalewayMock, type ScalewayMock } from "./support/scaleway-mock.ts";
@@ -111,6 +112,36 @@ describe("Service", () => {
       yield* stack.deploy(deployService({ PLAIN: "changed" }));
       const patches = mock.calls.filter((call) => call.method === "PATCH" && call.url.includes("/containers/"));
       expect(JSON.parse(patches.at(-1)?.body ?? "{}").environment_variables.PLAIN).toBe("changed");
+    }),
+  );
+});
+
+const ModuleNamespace = Scaleway.Namespace("ModuleNs", {});
+const ModuleRegistry = Scaleway.RegistryNamespace("ModuleRegistry", { name: "module-registry" });
+
+class ModuleApi extends Scaleway.Service<ModuleApi>()(
+  "ModuleApi",
+  {
+    namespace: ModuleNamespace,
+    registry: ModuleRegistry,
+    main,
+    env: {
+      REGISTRY_ID: Effect.map(ModuleRegistry, (registry) =>
+        Output.interpolate`registry:${registry.registryNamespaceId}`.pipe(Output.map(Redacted.make)),
+      ),
+    },
+  },
+  Effect.succeed({ fetch: Effect.succeed(HttpServerResponse.text("ok")) }),
+) {}
+
+describe("Service with module-scope resources", () => {
+  test.provider("resolves Effect-valued namespace, registry and env at plan time", (stack) =>
+    Effect.gen(function* () {
+      const service = yield* stack.deploy(ModuleApi);
+      expect(service.imageRef).toMatch(/^rg\.fr-par\.scw\.cloud\/module-registry\/moduleapi:service-/);
+      const body = JSON.parse(containerCreates().at(0)?.body ?? "{}");
+      expect(body.secret_environment_variables.REGISTRY_ID).toMatch(/^registry:/);
+      expect(body.environment_variables).not.toHaveProperty("REGISTRY_ID");
     }),
   );
 });
