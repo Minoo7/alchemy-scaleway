@@ -1,13 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { imageLayer } from "../src/ImageLayer.ts";
-import {
-  copyImage,
-  parseImageReference,
-  patchImageConfig,
-  pushLayeredImage,
-  resolveSourceDigest,
-} from "../src/RegistryClient.ts";
+import { copyImage, parseImageReference, resolveSourceDigest } from "../src/RegistryClient.ts";
 
 const sha256 = (data: Uint8Array) => `sha256:${createHash("sha256").update(data).digest("hex")}`;
 const bytes = (value: string) => new TextEncoder().encode(value);
@@ -469,95 +462,5 @@ describe("resolveSourceDigest", () => {
     expect(await resolveSourceDigest(`${src.host}/app/api:1.0`, undefined, undefined, { allPlatforms: false })).toBe(
       seeded.amd64.digest,
     );
-  });
-});
-
-describe("pushLayeredImage", () => {
-  const layer = imageLayer([
-    { path: "app/", type: "directory", mode: 0o755 },
-    { path: "app/index.mjs", type: "file", mode: 0o644, content: bytes("console.log(1)") },
-  ]);
-  const config = {
-    env: { PORT: "8080", NODE_ENV: "production" },
-    workingDir: "/app",
-    entrypoint: ["node", "/app/index.mjs"],
-    cmd: null,
-    exposedPorts: ["8080/tcp"],
-  };
-
-  test("adds one layer and a patched config on top of the base platform image", async () => {
-    const src = track(startRegistry());
-    const dest = track(startRegistry({ basic: "nologin:secret" }));
-    const base = seedIndex(src, "library/node", "24-slim");
-
-    const result = await pushLayeredImage({
-      base: `${src.host}/library/node:24-slim`,
-      destination: `${dest.host}/ns/api`,
-      destAuth: { username: "nologin", password: "secret" },
-      destTags: ["service-abc", "service"],
-      layer,
-      config,
-    });
-
-    const pushed = JSON.parse(new TextDecoder().decode(dest.manifests.get("service")!.raw));
-    expect(sha256(dest.manifests.get("service")!.raw)).toBe(result.digest);
-    expect(dest.manifests.get("service-abc")).toEqual(dest.manifests.get("service"));
-    expect(pushed.mediaType).toBe(OCI_MANIFEST);
-    expect(pushed.layers.map((entry: { digest: string }) => entry.digest)).toEqual([base.amd64.layerDigest, layer.digest]);
-    expect(pushed.layers[1].mediaType).toBe("application/vnd.oci.image.layer.v1.tar+gzip");
-    expect(dest.blobs.get(layer.digest)).toEqual(layer.data);
-    expect(dest.blobs.has(base.arm64.layerDigest)).toBe(false);
-
-    const pushedConfig = JSON.parse(new TextDecoder().decode(dest.blobs.get(pushed.config.digest)!));
-    expect(pushedConfig.salt).toBe("amd64");
-    expect(pushedConfig.rootfs.diff_ids).toEqual([layer.diffId]);
-    expect(pushedConfig.config).toEqual({
-      Env: ["PORT=8080", "NODE_ENV=production"],
-      WorkingDir: "/app",
-      Entrypoint: ["node", "/app/index.mjs"],
-      Cmd: null,
-      ExposedPorts: { "8080/tcp": {} },
-    });
-  });
-
-  test("is reproducible and uploads nothing new when pushed again", async () => {
-    const src = track(startRegistry());
-    const dest = track(startRegistry());
-    seedImage(src, "library/node", "24-slim", "base");
-    const request = {
-      base: `${src.host}/library/node:24-slim`,
-      destination: `${dest.host}/ns/api`,
-      destTags: ["service"],
-      layer,
-      config,
-    };
-
-    const first = await pushLayeredImage(request);
-    const uploads = dest.uploads;
-    const second = await pushLayeredImage(request);
-
-    expect(second.digest).toBe(first.digest);
-    expect(dest.uploads).toBe(uploads);
-  });
-});
-
-describe("patchImageConfig", () => {
-  test("replaces same-named env entries, keeps the rest and appends the layer", () => {
-    const patched = patchImageConfig(
-      {
-        config: { Env: ["PATH=/usr/local/bin", "NODE_ENV=development"], Entrypoint: ["docker-entrypoint.sh"], Cmd: ["node"] },
-        rootfs: { type: "layers", diff_ids: ["sha256:base"] },
-        history: [{ created_by: "base" }],
-      },
-      { env: { NODE_ENV: "production" }, entrypoint: ["node", "/app/index.mjs"], cmd: null },
-      "sha256:app",
-    );
-    expect(patched.config).toEqual({
-      Env: ["PATH=/usr/local/bin", "NODE_ENV=production"],
-      Entrypoint: ["node", "/app/index.mjs"],
-      Cmd: null,
-    });
-    expect(patched.rootfs?.diff_ids).toEqual(["sha256:base", "sha256:app"]);
-    expect(patched.history).toHaveLength(2);
   });
 });

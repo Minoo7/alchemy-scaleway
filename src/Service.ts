@@ -3,13 +3,21 @@ import * as Bundle from "alchemy/Bundle";
 import { isResolved } from "alchemy/Diff";
 import { Platform, type Main, type PlatformProps } from "alchemy/Platform";
 import * as Provider from "alchemy/Provider";
+import type { ScopedPlanStatusSession } from "alchemy/Report";
 import type { Resource } from "alchemy/Resource";
 import { unpackEnvValue } from "alchemy/RuntimeContext";
 import { createContainerRuntimeContext, type HostRuntimeContext, type ServerHost } from "alchemy/Server";
 import { Stack } from "alchemy/Stack";
 import { Stage } from "alchemy/Stage";
-import { copyExtraFiles, hashExtraFiles, sha256Object, type ExtraFile } from "alchemy/Util";
-import { spawn } from "node:child_process";
+import { Docker, DockerLive, type RegistryCredentials } from "alchemy/Docker/Docker";
+import {
+  copyExtraFiles,
+  extraFileDestination,
+  hashExtraFiles,
+  isContextRootDest,
+  sha256Object,
+  type ExtraFile,
+} from "alchemy/Util";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -26,19 +34,12 @@ import {
 import { registryPrefix, type ContainerImageRegistryRef } from "./ContainerImage.ts";
 import { ScalewayCredentials } from "./Credentials.ts";
 import { ScalewayError } from "./Errors.ts";
-import { directoryEntries, imageLayer } from "./ImageLayer.ts";
 import type { NamedNamespace } from "./Internal.ts";
 import type { Providers } from "./Providers.ts";
-import {
-  pushLayeredImage,
-  type LayeredImageRequest,
-  type LayeredImageResult,
-  type RegistryAuth,
-} from "./RegistryClient.ts";
 
 export const DEFAULT_SERVICE_BASE_IMAGE = "node:24-slim";
 export const DEFAULT_SERVICE_PORT = 8080;
-export const SERVICE_PLATFORM = { os: "linux", architecture: "amd64" } as const;
+export const SERVICE_PLATFORM = "linux/amd64";
 
 /** This package's own SSH scanner dependency; never loaded by a hosted program. */
 const SERVICE_DEFAULT_EXTERNALS = ["ssh2", "cpu-features"];
@@ -52,9 +53,7 @@ export const SERVICE_BOOTSTRAP_MODULE = "alchemy/Runtime/Bootstrap/Hetzner";
 export interface ServiceBuildOptions extends Bundle.BundleConfig {
   /**
    * Packages installed into the image with `npm install` instead of bundled.
-   * CommonJS drivers such as `pg` belong here. The install runs on the deploy
-   * machine for linux/x64, so packages that compile native code during install
-   * are not supported; prebuilt linux-x64 binaries are.
+   * CommonJS drivers such as `pg` belong here.
    */
   readonly install?: Bundle.PackageInstall;
 }
@@ -75,7 +74,7 @@ export interface ServiceProps extends PlatformProps {
   main: string;
   /** Named export loaded from `main`. @default "default" */
   handler?: string;
-  /** Base image the program's layer is added to; must provide `node` on `PATH`. @default "node:24-slim" */
+  /** Base image of the generated Dockerfile. @default "node:24-slim" */
   image?: string;
   /** Repository name inside the registry namespace. Defaults to the logical id. */
   repository?: string;
@@ -107,7 +106,6 @@ export type Service = Resource<
   ServiceProps,
   Container["Attributes"] & {
     imageRef: string;
-    imageDigest: string;
     codeHash: string;
     containerImage: ServiceImage;
   },
@@ -122,7 +120,6 @@ export interface ServiceImage {
   registry: string;
   repository: string;
   tag: string;
-  digest: string;
 }
 
 export type ServiceServices = ServerHost;
@@ -232,56 +229,33 @@ const { ${handler}: entrypoint } = await import(${JSON.stringify(importPath)});
 await bootstrap(entrypoint);
 `;
 
-/** The image config that runs the bundled program, replacing a Dockerfile. */
-export const serviceImageConfig = (port: number): LayeredImageRequest["config"] => ({
-  env: { PORT: String(port), HOST: "0.0.0.0", NODE_ENV: "production" },
-  workingDir: "/app",
-  entrypoint: ["node", "/app/index.mjs"],
-  cmd: null,
-  exposedPorts: [`${port}/tcp`],
-});
-
-/**
- * Image build seam. The default installs `build.install` packages with npm and
- * pushes through the pure-TypeScript Registry v2 client; tests can substitute a fake.
- */
-export interface ServiceImageEngine {
-  install(directory: string): Effect.Effect<void, Error>;
-  push(request: LayeredImageRequest): Effect.Effect<LayeredImageResult, Error>;
-}
-
-const toError = (cause: unknown) => (cause instanceof Error ? cause : new Error(String(cause)));
-
-const npmInstall = (directory: string) =>
-  new Promise<void>((resolve, reject) => {
-    const child = spawn(
-      "npm",
-      ["install", "--omit=dev", "--no-fund", "--no-audit", "--no-package-lock", "--os=linux", "--cpu=x64", "--libc=glibc"],
-      { cwd: directory, stdio: ["ignore", "ignore", "pipe"] },
-    );
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`npm install failed with exit code ${code}: ${stderr.trim()}`)),
-    );
-  });
-
-const defaultImageEngine: ServiceImageEngine = {
-  install: (directory) => Effect.tryPromise({ try: () => npmInstall(directory), catch: toError }),
-  push: (request) => Effect.tryPromise({ try: (signal) => pushLayeredImage({ ...request, signal }), catch: toError }),
-};
-
-let imageEngine = defaultImageEngine;
-
-export const setServiceImageEngine = (next: ServiceImageEngine) => {
-  imageEngine = next;
-};
-
-export const resetServiceImageEngine = () => {
-  imageEngine = defaultImageEngine;
+export const generateServiceDockerfile = (
+  props: Pick<ServiceProps, "image" | "port" | "extraFiles">,
+  hasChunks: boolean,
+  hasInstall: boolean,
+) => {
+  const port = props.port ?? DEFAULT_SERVICE_PORT;
+  const lines = [`FROM ${props.image ?? DEFAULT_SERVICE_BASE_IMAGE}`, "WORKDIR /app"];
+  if (hasInstall) {
+    lines.push("COPY package.json /app/package.json", "RUN npm install --omit=dev --no-fund --no-audit");
+  }
+  lines.push("COPY index.mjs /app/index.mjs");
+  if (hasChunks) lines.push("COPY *.js /app/");
+  const seen = new Set<string>();
+  for (const extra of props.extraFiles ?? []) {
+    const dest = extraFileDestination(extra.dest);
+    if (isContextRootDest(dest) || seen.has(dest)) continue;
+    seen.add(dest);
+    lines.push(`COPY ${dest} /app/${dest}`);
+  }
+  lines.push(
+    `ENV PORT=${port}`,
+    "ENV HOST=0.0.0.0",
+    "ENV NODE_ENV=production",
+    `EXPOSE ${port}`,
+    'ENTRYPOINT ["node", "/app/index.mjs"]',
+  );
+  return `${lines.join("\n")}\n`;
 };
 
 const installManifest = (dependencies: Record<string, string>) =>
@@ -313,6 +287,7 @@ const codePropsOf = (props: ServiceProps): ServiceCodeProps => ({
 
 const makeServiceBundler = Effect.gen(function* () {
   const { dotAlchemy } = yield* AlchemyContext;
+  const docker = yield* Docker;
   const virtualEntryPlugin = yield* Bundle.virtualEntryPlugin;
 
   const bundle = Effect.fn(function* (props: ServiceCodeProps) {
@@ -356,39 +331,35 @@ const makeServiceBundler = Effect.gen(function* () {
       content: typeof file.content === "string" ? new TextEncoder().encode(file.content) : file.content,
     }));
     const packageJson = install === undefined ? undefined : installManifest(install);
+    const dockerfile = generateServiceDockerfile(props, files.length > 1, packageJson !== undefined);
     const codeHash = (yield* sha256Object({
       bundleHash: output.hash,
+      dockerfile,
       packageJson,
       extraFiles: yield* hashExtraFiles(props.extraFiles),
-      image: props.image ?? DEFAULT_SERVICE_BASE_IMAGE,
-      port: props.port ?? DEFAULT_SERVICE_PORT,
     })).slice(0, 16);
-    return { realMain, files, packageJson, codeHash };
+    return { realMain, files, dockerfile, packageJson, codeHash };
   });
 
-  /** Write the `/app` tree for a bundled program, install its packages and return its layer. */
+  /** Write the Docker build context for a bundled program and return its directory. */
   const materialize = Effect.fn(function* (
     id: string,
     bundled: Effect.Success<ReturnType<typeof bundle>>,
     extraFiles: ServiceProps["extraFiles"],
   ) {
     const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const context = yield* Bundle.getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-app`);
+    const context = yield* Bundle.getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-image`);
     yield* fs.remove(context, { recursive: true }).pipe(Effect.ignore);
-    yield* fs.makeDirectory(context, { recursive: true });
-    for (const file of bundled.files) {
-      const target = path.join(context, file.path);
-      yield* fs.makeDirectory(path.dirname(target), { recursive: true });
-      yield* fs.writeFile(target, file.content);
-    }
-    if (bundled.packageJson !== undefined) {
-      yield* fs.writeFileString(path.join(context, "package.json"), bundled.packageJson);
-      yield* imageEngine.install(context);
-    }
+    yield* docker.materialize({
+      context,
+      dockerfile: bundled.dockerfile,
+      files: [
+        ...bundled.files,
+        ...(bundled.packageJson === undefined ? [] : [{ path: "package.json", content: bundled.packageJson }]),
+      ],
+    });
     yield* copyExtraFiles(context, extraFiles);
-    const entries = yield* Effect.tryPromise({ try: () => directoryEntries(context, "app"), catch: toError });
-    return imageLayer(entries);
+    return context;
   });
 
   return { bundle, materialize };
@@ -396,7 +367,7 @@ const makeServiceBundler = Effect.gen(function* () {
 
 const containerPropsOf = Effect.fnUntraced(function* (
   props: ServiceProps,
-  image: { ref: string; digest: string },
+  imageRef: string,
   runtimeEnv: Record<string, string>,
 ) {
   const port = props.port ?? DEFAULT_SERVICE_PORT;
@@ -409,8 +380,7 @@ const containerPropsOf = Effect.fnUntraced(function* (
     namespace: yield* resolved(props.namespace, "namespace"),
     name: props.name,
     description: props.description,
-    image: image.ref,
-    imageDigest: image.digest,
+    image: imageRef,
     port,
     environmentVariables,
     secretEnvironmentVariables,
@@ -431,7 +401,8 @@ const serviceProvider = () =>
     Service,
     Effect.gen(function* () {
       const containers = yield* Container.Provider;
-      const credentials = yield* (yield* ScalewayCredentials);
+      const credentials = yield* ScalewayCredentials;
+      const docker = yield* Docker;
       const bundler = yield* makeServiceBundler;
       const stack = yield* Stack;
       const stage = yield* Stage;
@@ -440,40 +411,32 @@ const serviceProvider = () =>
         ALCHEMY_STAGE: stage,
         ALCHEMY_PHASE: "runtime",
       };
-      const registryAuth = (registry: string): RegistryAuth | undefined =>
-        (registry.split("/")[0] ?? registry).endsWith(".scw.cloud")
-          ? { username: "nologin", password: Redacted.value(credentials.secretKey) }
-          : undefined;
+      /** Push credentials for a Scaleway registry; other registries use the build machine's Docker login. */
+      const registryCredentials = Effect.fnUntraced(function* (registry: string) {
+        const server = registry.split("/")[0] ?? registry;
+        if (!server.endsWith(".scw.cloud")) return undefined;
+        return { server, username: "nologin", password: (yield* credentials).secretKey } satisfies RegistryCredentials;
+      });
       const buildImage = Effect.fnUntraced(function* (
         id: string,
         props: ServiceProps,
         bundled: Effect.Success<ReturnType<typeof bundler.bundle>>,
-        session: { note(message: string): Effect.Effect<void> },
+        session: ScopedPlanStatusSession,
       ) {
         const registry = yield* registryPrefix(yield* resolved(props.registry, "registry"));
         const repository = repositoryOf(id, props);
         const tag = `service-${bundled.codeHash.slice(0, 12)}`;
-        const layer = yield* bundler.materialize(id, bundled, props.extraFiles);
-        const base = props.image ?? DEFAULT_SERVICE_BASE_IMAGE;
-        yield* session.note(`Pushing ${registry}/${repository}:${tag} on ${base}...`);
-        const { digest } = yield* imageEngine.push({
-          base,
-          destination: `${registry}/${repository}`,
-          destAuth: registryAuth(registry),
-          destTags: [tag, "service"],
-          platform: SERVICE_PLATFORM,
-          layer,
-          config: serviceImageConfig(props.port ?? DEFAULT_SERVICE_PORT),
-          onProgress: (message) => Effect.runPromise(session.note(message)),
-        });
-        return {
-          ref: `${registry}/${repository}:${tag}`,
-          stableRef: `${registry}/${repository}:service`,
-          registry,
-          repository,
-          tag,
-          digest,
-        } satisfies ServiceImage;
+        const ref = `${registry}/${repository}:${tag}`;
+        const stableRef = `${registry}/${repository}:service`;
+        const context = yield* bundler.materialize(id, bundled, props.extraFiles);
+        yield* session.note(`Building and pushing ${ref}...`);
+        yield* docker.image.build(
+          { context, tag: [ref, stableRef], platform: SERVICE_PLATFORM },
+          session,
+          yield* registryCredentials(registry),
+        );
+        yield* session.note(`Pushed ${ref}`);
+        return { ref, stableRef, registry, repository, tag } satisfies ServiceImage;
       });
       const repositoryOf = (id: string, props: ServiceProps) => props.repository ?? id.toLowerCase();
       /** The image already pushed for this code, registry and repository, if any. */
@@ -488,7 +451,6 @@ const serviceProvider = () =>
         const previous = output.containerImage;
         return previous.registry === registry && previous.repository === repositoryOf(id, props) ? previous : undefined;
       });
-      const deployedImage = (output: Service["Attributes"]) => ({ ref: output.imageRef, digest: output.imageDigest });
 
       return Service.Provider.of({
         stables: ["containerId", "namespaceId"],
@@ -507,7 +469,7 @@ const serviceProvider = () =>
             id,
             fqn,
             instanceId,
-            olds: yield* containerPropsOf(olds, deployedImage(output), runtimeEnv),
+            olds: yield* containerPropsOf(olds, output.imageRef, runtimeEnv),
             output,
           });
           return container === undefined ? undefined : { ...output, ...container };
@@ -522,20 +484,20 @@ const serviceProvider = () =>
             id,
             fqn,
             instanceId,
-            news: yield* containerPropsOf(news, image, runtimeEnv),
-            olds: olds && output ? yield* containerPropsOf(olds, deployedImage(output), runtimeEnv) : undefined,
+            news: yield* containerPropsOf(news, image.ref, runtimeEnv),
+            olds: olds && output ? yield* containerPropsOf(olds, output.imageRef, runtimeEnv) : undefined,
             output,
             session,
             bindings: [],
           });
-          return { ...container, imageRef: image.ref, imageDigest: image.digest, codeHash, containerImage: image };
+          return { ...container, imageRef: image.ref, codeHash, containerImage: image };
         }),
         delete: Effect.fnUntraced(function* ({ id, fqn, instanceId, olds, output, session }) {
           yield* containers.delete({
             id,
             fqn,
             instanceId,
-            olds: yield* containerPropsOf(olds, deployedImage(output), runtimeEnv),
+            olds: yield* containerPropsOf(olds, output.imageRef, runtimeEnv),
             output,
             session,
             bindings: [],
@@ -546,5 +508,6 @@ const serviceProvider = () =>
     }),
   );
 
-/** The Service provider with its own Container lifecycle. */
-export const ServiceProvider = () => serviceProvider().pipe(Layer.provide(ContainerProvider()));
+/** The Service provider with its own Container lifecycle and Alchemy's Docker service. */
+export const ServiceProvider = () =>
+  serviceProvider().pipe(Layer.provide(ContainerProvider()), Layer.provide(DockerLive));

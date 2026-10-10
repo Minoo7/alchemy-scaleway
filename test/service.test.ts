@@ -4,10 +4,9 @@ import * as Layer from "effect/Layer";
 import * as Config from "effect/Config";
 import * as Redacted from "effect/Redacted";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gunzipSync } from "node:zlib";
 import * as Output from "alchemy/Output";
 import { packEnvValue } from "alchemy/RuntimeContext";
 import * as Test from "alchemy/Test/Bun";
@@ -19,34 +18,34 @@ const { test } = Test.make({ providers: testProviders() });
 const main = join(import.meta.dir, "fixtures", "service", "main.ts");
 
 let mock: ScalewayMock;
-let pushes: Scaleway.LayeredImageRequest[];
-let installs: string[];
+let dockerLog: string;
 
-const fakeImageEngine: Scaleway.ServiceImageEngine = {
-  install: (directory) =>
-    Effect.sync(() => {
-      installs.push(directory);
-      mkdirSync(join(directory, "node_modules", "effect"), { recursive: true });
-      writeFileSync(join(directory, "node_modules", "effect", "index.js"), "installed");
-    }),
-  push: (request) =>
-    Effect.sync(() => {
-      pushes.push(request);
-      return { digest: `sha256:${request.layer.digest.slice(7, 19)}${"0".repeat(52)}` };
-    }),
-};
+interface DockerCall {
+  args: string[];
+  servers: string[];
+  build?: { files: string[]; dockerfile: string; entry: string };
+}
+
+const dockerCalls = (): DockerCall[] =>
+  readFileSync(dockerLog, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 
 beforeEach(() => {
   mock = installScalewayMock();
-  pushes = [];
-  installs = [];
+  dockerLog = join(mkdtempSync(join(tmpdir(), "service-docker-")), "calls.jsonl");
+  writeFileSync(dockerLog, "");
+  process.env.DOCKER_BIN = join(import.meta.dir, "fixtures", "docker", "fake-docker.ts");
+  process.env.FAKE_DOCKER_LOG = dockerLog;
   process.env.SERVICE_FIXTURE_TOKEN = "fixture-secret";
   process.env.SERVICE_FIXTURE_REGION = "fr-par";
-  Scaleway.setServiceImageEngine(fakeImageEngine);
 });
 
 afterEach(() => {
-  Scaleway.resetServiceImageEngine();
+  delete process.env.DOCKER_BIN;
+  delete process.env.FAKE_DOCKER_LOG;
+  delete process.env.FAKE_DOCKER_FAIL_BUILD;
   delete process.env.SERVICE_FIXTURE_TOKEN;
   delete process.env.SERVICE_FIXTURE_REGION;
   mock.restore();
@@ -55,30 +54,8 @@ afterEach(() => {
 const containerCreates = () =>
   mock.calls.filter((call) => call.method === "POST" && new URL(call.url).pathname.endsWith("/containers"));
 
-const builds = () => pushes;
+const builds = () => dockerCalls().filter((call) => call.args[0] === "buildx" && call.args[1] === "build");
 
-const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes).replace(/\0[\s\S]*$/, "");
-
-/** Path → content of every entry in a gzipped tar layer, following PAX `path` records. */
-const layerFiles = (data: Uint8Array) => {
-  const tar = gunzipSync(data);
-  const files = new Map<string, string>();
-  let paxPath: string | undefined;
-  for (let offset = 0; offset + 512 <= tar.length; ) {
-    const header = tar.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    const size = Number.parseInt(text(header.subarray(124, 136)).trim() || "0", 8);
-    const body = tar.subarray(offset + 512, offset + 512 + size);
-    if (String.fromCharCode(header[156]!) === "x") {
-      paxPath = /\d+ path=(.*)\n/.exec(new TextDecoder().decode(body))?.[1];
-    } else {
-      files.set(paxPath ?? text(header.subarray(0, 100)), new TextDecoder().decode(body));
-      paxPath = undefined;
-    }
-    offset += 512 + Math.ceil(size / 512) * 512;
-  }
-  return files;
-};
 const containerPatches = () =>
   mock.calls.filter((call) => call.method === "PATCH" && call.url.includes("/containers/"));
 
@@ -106,19 +83,17 @@ describe("Service", () => {
       expect(service.codeHash).toMatch(/^[a-f0-9]{16}$/);
       expect(service.url).toContain(".functions.fnc.fr-par.scw.cloud");
 
-      expect(pushes).toHaveLength(1);
-      const push = pushes[0]!;
-      expect(push.base).toBe("node:24-slim");
-      expect(push.destination).toBe("rg.fr-par.scw.cloud/demo-registry/api");
-      expect(push.destTags).toEqual([service.imageRef.split(":").at(-1)!, "service"]);
-      expect(push.destAuth).toEqual({ username: "nologin", password: "test-secret" });
-      expect(push.platform).toEqual({ os: "linux", architecture: "amd64" });
-      expect(push.config).toEqual(Scaleway.serviceImageConfig(8080));
-      expect(service.imageDigest).toBe(`sha256:${push.layer.digest.slice(7, 19)}${"0".repeat(52)}`);
-      const files = layerFiles(push.layer.data);
-      expect(files.get("app/index.mjs")).toContain("Hetzner service");
-      expect(files.has("app/Dockerfile")).toBe(false);
-      expect(installs).toHaveLength(0);
+      expect(builds()).toHaveLength(1);
+      const build = builds()[0]!;
+      expect(build.args.slice(0, 3)).toEqual(["buildx", "build", "--push"]);
+      expect(build.args).toContain(service.imageRef);
+      expect(build.args).toContain("rg.fr-par.scw.cloud/demo-registry/api:service");
+      expect(build.args.join(" ")).toContain("--platform linux/amd64");
+      expect(build.servers).toEqual(["rg.fr-par.scw.cloud"]);
+      expect(build.build?.dockerfile).toContain("FROM node:24-slim");
+      expect(build.build?.dockerfile).toContain('ENTRYPOINT ["node", "/app/index.mjs"]');
+      expect(build.build?.dockerfile).not.toContain("npm install");
+      expect(build.build?.entry).toContain("Hetzner service");
 
       const body = JSON.parse(containerCreates().at(0)?.body ?? "{}");
       expect(body.image).toBe(service.imageRef);
@@ -178,14 +153,14 @@ describe("Service", () => {
     }),
   );
 
-  test.provider("installs build.install packages into the image layer", (stack) =>
+  test.provider("installs build.install packages in the image with npm", (stack) =>
     Effect.gen(function* () {
       yield* stack.deploy(deployService({}, { build: { install: ["effect"] } }));
 
-      expect(installs).toHaveLength(1);
-      const files = layerFiles(pushes[0]!.layer.data);
-      expect(JSON.parse(files.get("app/package.json")!).dependencies.effect).toMatch(/^\d/);
-      expect(files.get("app/node_modules/effect/index.js")).toBe("installed");
+      const build = builds()[0]!.build!;
+      expect(build.files).toContain("package.json");
+      expect(build.dockerfile).toContain("COPY package.json /app/package.json");
+      expect(build.dockerfile).toContain("RUN npm install --omit=dev --no-fund --no-audit");
     }),
   );
 
@@ -199,17 +174,14 @@ describe("Service", () => {
     }),
   );
 
-  test.provider("a failed image push fails the deploy before any container exists", (stack) =>
+  test.provider("a failed image build fails the deploy before any container exists", (stack) =>
     Effect.gen(function* () {
-      Scaleway.setServiceImageEngine({
-        ...fakeImageEngine,
-        push: () => Effect.fail(new Error("registry push failed")),
-      });
+      process.env.FAKE_DOCKER_FAIL_BUILD = "1";
 
       const exit = yield* Effect.exit(stack.deploy(deployService()));
 
       expect(exit._tag).toBe("Failure");
-      expect(String(exit)).toContain("registry push failed");
+      expect(String(exit)).toContain("base image not found");
       expect(containerCreates()).toHaveLength(0);
     }),
   );
@@ -280,15 +252,36 @@ describe("Service with module-scope resources", () => {
   );
 });
 
-describe("serviceImageConfig", () => {
-  unitTest("runs the bundled entry from /app on the service port", () => {
-    expect(Scaleway.serviceImageConfig(3000)).toEqual({
-      env: { PORT: "3000", HOST: "0.0.0.0", NODE_ENV: "production" },
-      workingDir: "/app",
-      entrypoint: ["node", "/app/index.mjs"],
-      cmd: null,
-      exposedPorts: ["3000/tcp"],
-    });
+describe("generateServiceDockerfile", () => {
+  unitTest("installs, copies chunks and deduplicates extra files only when needed", () => {
+    const minimal = Scaleway.generateServiceDockerfile({}, false, false);
+    expect(minimal).not.toContain("npm install");
+    expect(minimal).not.toContain("COPY *.js");
+    expect(minimal).toContain("ENV PORT=8080");
+
+    const full = Scaleway.generateServiceDockerfile(
+      {
+        image: "node:24-alpine",
+        port: 3000,
+        extraFiles: [
+          { source: "a", dest: "public" },
+          { source: "b", dest: "public" },
+          { source: "c", dest: "." },
+        ],
+      },
+      true,
+      true,
+    );
+    expect(full.split("\n").slice(0, 4)).toEqual([
+      "FROM node:24-alpine",
+      "WORKDIR /app",
+      "COPY package.json /app/package.json",
+      "RUN npm install --omit=dev --no-fund --no-audit",
+    ]);
+    expect(full).toContain("COPY *.js /app/");
+    expect(full.match(/COPY public /g)).toHaveLength(1);
+    expect(full).not.toContain("COPY . ");
+    expect(full).toContain("EXPOSE 3000");
   });
 });
 

@@ -4,11 +4,11 @@
  *   op run --environment <alchemy-scaleway-production> -- \
  *     SCW_LIVE_SERVICE_TEST=1 bun run scripts/scaleway-service-smoke.ts
  *
- * Deploys scripts/smoke-service/main.ts as a Service (bundle, daemonless
- * image push to a temporary registry namespace, Serverless Container),
+ * Deploys scripts/smoke-service/main.ts as a Service (bundle, Docker build
+ * and push to a temporary registry namespace, Serverless Container),
  * fetches it until it answers with its bound secret and plain env value,
  * redeploys unchanged, then destroys the stack and fails on leaked containers.
- * Needs no Docker daemon; npm is only used when `build.install` is set.
+ * Requires a local Docker CLI with Buildx.
  */
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
