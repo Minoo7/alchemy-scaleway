@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Provider from "alchemy/Provider";
+import { Random, RandomProvider } from "alchemy/Random";
 import { Bucket, BucketProvider } from "../../src/Bucket.ts";
 import { Container, ContainerProvider } from "../../src/Container.ts";
 import { ContainerImage, ContainerImageProvider } from "../../src/ContainerImage.ts";
@@ -53,6 +54,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
   Layer.effect(
     Providers,
     Provider.collection([
+      Random,
       Namespace,
       Project,
       Container,
@@ -85,6 +87,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
+        RandomProvider(),
         NamespaceProvider(),
         ProjectProvider(),
         ContainerProvider(),

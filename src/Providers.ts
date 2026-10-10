@@ -1,6 +1,7 @@
 import * as Layer from "effect/Layer";
 import { CredentialsStoreLive } from "alchemy/Auth/Credentials";
 import { ProfileStoreLive } from "alchemy/Auth/Profile";
+import { Random, RandomProvider } from "alchemy/Random";
 import * as Provider from "alchemy/Provider";
 import { ScalewayAuth } from "./AuthProvider.ts";
 import { Bucket, BucketProvider } from "./Bucket.ts";
@@ -47,6 +48,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
   Layer.effect(
     Providers,
     Provider.collection([
+      Random,
       Namespace,
       Project,
       Container,
@@ -79,6 +81,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
+        RandomProvider(),
         NamespaceProvider(),
         ProjectProvider(),
         ContainerProvider(),

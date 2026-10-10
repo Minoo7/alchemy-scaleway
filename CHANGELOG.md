@@ -13,6 +13,8 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
   pushed with Alchemy's `Docker` service.
   Env-only changes and secret rotation redeploy without rebuilding the image.
 - `smoke:scaleway:service`: an opt-in live smoke test for `Service`.
+- `Scaleway.providers()` registers Alchemy's `Random`, like the Cloudflare,
+  AWS, Fly and Railway provider bundles, so stacks can mint stable secrets.
 - Non-interactive profile configuration: `alchemy profile edit --add Scaleway
   --method stored --set secretKey=env:SCW_SECRET_KEY ...` (and `--method env`),
   with field validation before anything is written.
