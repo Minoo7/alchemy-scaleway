@@ -8,14 +8,8 @@ import { unpackEnvValue } from "alchemy/RuntimeContext";
 import { createContainerRuntimeContext, type HostRuntimeContext, type ServerHost } from "alchemy/Server";
 import { Stack } from "alchemy/Stack";
 import { Stage } from "alchemy/Stage";
-import {
-  copyExtraFiles,
-  extraFileDestination,
-  hashExtraFiles,
-  isContextRootDest,
-  sha256Object,
-  type ExtraFile,
-} from "alchemy/Util";
+import { copyExtraFiles, hashExtraFiles, sha256Object, type ExtraFile } from "alchemy/Util";
+import { spawn } from "node:child_process";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -29,19 +23,22 @@ import {
   type ContainerPrivacy,
   type ContainerProps,
 } from "./Container.ts";
-import {
-  ContainerImage,
-  ContainerImageProvider,
-  registryPrefix,
-  type ContainerImageRegistryRef,
-} from "./ContainerImage.ts";
+import { registryPrefix, type ContainerImageRegistryRef } from "./ContainerImage.ts";
+import { ScalewayCredentials } from "./Credentials.ts";
 import { ScalewayError } from "./Errors.ts";
+import { directoryEntries, imageLayer } from "./ImageLayer.ts";
 import type { NamedNamespace } from "./Internal.ts";
 import type { Providers } from "./Providers.ts";
+import {
+  pushLayeredImage,
+  type LayeredImageRequest,
+  type LayeredImageResult,
+  type RegistryAuth,
+} from "./RegistryClient.ts";
 
 export const DEFAULT_SERVICE_BASE_IMAGE = "node:24-slim";
 export const DEFAULT_SERVICE_PORT = 8080;
-export const SERVICE_PLATFORM = "linux/amd64";
+export const SERVICE_PLATFORM = { os: "linux", architecture: "amd64" } as const;
 
 /** This package's own SSH scanner dependency; never loaded by a hosted program. */
 const SERVICE_DEFAULT_EXTERNALS = ["ssh2", "cpu-features"];
@@ -55,7 +52,9 @@ export const SERVICE_BOOTSTRAP_MODULE = "alchemy/Runtime/Bootstrap/Hetzner";
 export interface ServiceBuildOptions extends Bundle.BundleConfig {
   /**
    * Packages installed into the image with `npm install` instead of bundled.
-   * CommonJS drivers such as `pg` belong here.
+   * CommonJS drivers such as `pg` belong here. The install runs on the deploy
+   * machine for linux/x64, so packages that compile native code during install
+   * are not supported; prebuilt linux-x64 binaries are.
    */
   readonly install?: Bundle.PackageInstall;
 }
@@ -76,7 +75,7 @@ export interface ServiceProps extends PlatformProps {
   main: string;
   /** Named export loaded from `main`. @default "default" */
   handler?: string;
-  /** Base image of the generated Dockerfile. @default "node:24-slim" */
+  /** Base image the program's layer is added to; must provide `node` on `PATH`. @default "node:24-slim" */
   image?: string;
   /** Repository name inside the registry namespace. Defaults to the logical id. */
   repository?: string;
@@ -110,11 +109,21 @@ export type Service = Resource<
     imageRef: string;
     imageDigest: string;
     codeHash: string;
-    containerImage: ContainerImage["Attributes"];
+    containerImage: ServiceImage;
   },
   never,
   Providers
 >;
+
+/** The image pushed for a Service. */
+export interface ServiceImage {
+  ref: string;
+  stableRef: string;
+  registry: string;
+  repository: string;
+  tag: string;
+  digest: string;
+}
 
 export type ServiceServices = ServerHost;
 export type ServiceShape = Main<ServiceServices>;
@@ -223,33 +232,56 @@ const { ${handler}: entrypoint } = await import(${JSON.stringify(importPath)});
 await bootstrap(entrypoint);
 `;
 
-export const generateServiceDockerfile = (
-  props: Pick<ServiceProps, "image" | "port" | "extraFiles">,
-  hasChunks: boolean,
-  hasInstall: boolean,
-) => {
-  const port = props.port ?? DEFAULT_SERVICE_PORT;
-  const lines = [`FROM ${props.image ?? DEFAULT_SERVICE_BASE_IMAGE}`, "WORKDIR /app"];
-  if (hasInstall) {
-    lines.push("COPY package.json /app/package.json", "RUN npm install --omit=dev --no-fund --no-audit");
-  }
-  lines.push("COPY index.mjs /app/index.mjs");
-  if (hasChunks) lines.push("COPY *.js /app/");
-  const seen = new Set<string>();
-  for (const extra of props.extraFiles ?? []) {
-    const dest = extraFileDestination(extra.dest);
-    if (isContextRootDest(dest) || seen.has(dest)) continue;
-    seen.add(dest);
-    lines.push(`COPY ${dest} /app/${dest}`);
-  }
-  lines.push(
-    `ENV PORT=${port}`,
-    "ENV HOST=0.0.0.0",
-    "ENV NODE_ENV=production",
-    `EXPOSE ${port}`,
-    'ENTRYPOINT ["node", "/app/index.mjs"]',
-  );
-  return `${lines.join("\n")}\n`;
+/** The image config that runs the bundled program, replacing a Dockerfile. */
+export const serviceImageConfig = (port: number): LayeredImageRequest["config"] => ({
+  env: { PORT: String(port), HOST: "0.0.0.0", NODE_ENV: "production" },
+  workingDir: "/app",
+  entrypoint: ["node", "/app/index.mjs"],
+  cmd: null,
+  exposedPorts: [`${port}/tcp`],
+});
+
+/**
+ * Image build seam. The default installs `build.install` packages with npm and
+ * pushes through the pure-TypeScript Registry v2 client; tests can substitute a fake.
+ */
+export interface ServiceImageEngine {
+  install(directory: string): Effect.Effect<void, Error>;
+  push(request: LayeredImageRequest): Effect.Effect<LayeredImageResult, Error>;
+}
+
+const toError = (cause: unknown) => (cause instanceof Error ? cause : new Error(String(cause)));
+
+const npmInstall = (directory: string) =>
+  new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      "npm",
+      ["install", "--omit=dev", "--no-fund", "--no-audit", "--no-package-lock", "--os=linux", "--cpu=x64", "--libc=glibc"],
+      { cwd: directory, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`npm install failed with exit code ${code}: ${stderr.trim()}`)),
+    );
+  });
+
+const defaultImageEngine: ServiceImageEngine = {
+  install: (directory) => Effect.tryPromise({ try: () => npmInstall(directory), catch: toError }),
+  push: (request) => Effect.tryPromise({ try: (signal) => pushLayeredImage({ ...request, signal }), catch: toError }),
+};
+
+let imageEngine = defaultImageEngine;
+
+export const setServiceImageEngine = (next: ServiceImageEngine) => {
+  imageEngine = next;
+};
+
+export const resetServiceImageEngine = () => {
+  imageEngine = defaultImageEngine;
 };
 
 const installManifest = (dependencies: Record<string, string>) =>
@@ -323,18 +355,18 @@ const makeServiceBundler = Effect.gen(function* () {
       path: index === 0 ? "index.mjs" : file.path,
       content: typeof file.content === "string" ? new TextEncoder().encode(file.content) : file.content,
     }));
-    const dockerfile = generateServiceDockerfile(props, files.length > 1, install !== undefined);
     const packageJson = install === undefined ? undefined : installManifest(install);
     const codeHash = (yield* sha256Object({
       bundleHash: output.hash,
-      dockerfile,
       packageJson,
       extraFiles: yield* hashExtraFiles(props.extraFiles),
+      image: props.image ?? DEFAULT_SERVICE_BASE_IMAGE,
+      port: props.port ?? DEFAULT_SERVICE_PORT,
     })).slice(0, 16);
-    return { realMain, files, dockerfile, packageJson, codeHash };
+    return { realMain, files, packageJson, codeHash };
   });
 
-  /** Write the Docker context for a bundled program and return its directory. */
+  /** Write the `/app` tree for a bundled program, install its packages and return its layer. */
   const materialize = Effect.fn(function* (
     id: string,
     bundled: Effect.Success<ReturnType<typeof bundle>>,
@@ -342,7 +374,7 @@ const makeServiceBundler = Effect.gen(function* () {
   ) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const context = yield* Bundle.getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-image`);
+    const context = yield* Bundle.getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-app`);
     yield* fs.remove(context, { recursive: true }).pipe(Effect.ignore);
     yield* fs.makeDirectory(context, { recursive: true });
     for (const file of bundled.files) {
@@ -350,12 +382,13 @@ const makeServiceBundler = Effect.gen(function* () {
       yield* fs.makeDirectory(path.dirname(target), { recursive: true });
       yield* fs.writeFile(target, file.content);
     }
-    yield* fs.writeFileString(path.join(context, "Dockerfile"), bundled.dockerfile);
     if (bundled.packageJson !== undefined) {
       yield* fs.writeFileString(path.join(context, "package.json"), bundled.packageJson);
+      yield* imageEngine.install(context);
     }
     yield* copyExtraFiles(context, extraFiles);
-    return context;
+    const entries = yield* Effect.tryPromise({ try: () => directoryEntries(context, "app"), catch: toError });
+    return imageLayer(entries);
   });
 
   return { bundle, materialize };
@@ -398,7 +431,7 @@ const serviceProvider = () =>
     Service,
     Effect.gen(function* () {
       const containers = yield* Container.Provider;
-      const images = yield* ContainerImage.Provider;
+      const credentials = yield* (yield* ScalewayCredentials);
       const bundler = yield* makeServiceBundler;
       const stack = yield* Stack;
       const stage = yield* Stage;
@@ -407,7 +440,41 @@ const serviceProvider = () =>
         ALCHEMY_STAGE: stage,
         ALCHEMY_PHASE: "runtime",
       };
-      const imageId = (id: string) => `${id}Image`;
+      const registryAuth = (registry: string): RegistryAuth | undefined =>
+        (registry.split("/")[0] ?? registry).endsWith(".scw.cloud")
+          ? { username: "nologin", password: Redacted.value(credentials.secretKey) }
+          : undefined;
+      const buildImage = Effect.fnUntraced(function* (
+        id: string,
+        props: ServiceProps,
+        bundled: Effect.Success<ReturnType<typeof bundler.bundle>>,
+        session: { note(message: string): Effect.Effect<void> },
+      ) {
+        const registry = yield* registryPrefix(yield* resolved(props.registry, "registry"));
+        const repository = repositoryOf(id, props);
+        const tag = `service-${bundled.codeHash.slice(0, 12)}`;
+        const layer = yield* bundler.materialize(id, bundled, props.extraFiles);
+        const base = props.image ?? DEFAULT_SERVICE_BASE_IMAGE;
+        yield* session.note(`Pushing ${registry}/${repository}:${tag} on ${base}...`);
+        const { digest } = yield* imageEngine.push({
+          base,
+          destination: `${registry}/${repository}`,
+          destAuth: registryAuth(registry),
+          destTags: [tag, "service"],
+          platform: SERVICE_PLATFORM,
+          layer,
+          config: serviceImageConfig(props.port ?? DEFAULT_SERVICE_PORT),
+          onProgress: (message) => Effect.runPromise(session.note(message)),
+        });
+        return {
+          ref: `${registry}/${repository}:${tag}`,
+          stableRef: `${registry}/${repository}:service`,
+          registry,
+          repository,
+          tag,
+          digest,
+        } satisfies ServiceImage;
+      });
       const repositoryOf = (id: string, props: ServiceProps) => props.repository ?? id.toLowerCase();
       /** The image already pushed for this code, registry and repository, if any. */
       const reusableImage = Effect.fnUntraced(function* (
@@ -450,23 +517,7 @@ const serviceProvider = () =>
           const bundled = yield* bundler.bundle(codePropsOf(news));
           const codeHash = bundled.codeHash;
           const image =
-            (yield* reusableImage(id, news, codeHash, output)) ??
-            (yield* images.reconcile({
-              id: imageId(id),
-              fqn: imageId(fqn),
-              instanceId,
-              news: {
-                registry: yield* resolved(news.registry, "registry"),
-                context: yield* bundler.materialize(id, bundled, news.extraFiles),
-                repository: repositoryOf(id, news),
-                tag: "service",
-                platform: SERVICE_PLATFORM,
-              },
-              olds: undefined,
-              output: output?.containerImage,
-              session,
-              bindings: [],
-            }));
+            (yield* reusableImage(id, news, codeHash, output)) ?? (yield* buildImage(id, news, bundled, session));
           const container = yield* containers.reconcile({
             id,
             fqn,
@@ -495,6 +546,5 @@ const serviceProvider = () =>
     }),
   );
 
-/** The Service provider with its own Container and ContainerImage lifecycles. */
-export const ServiceProvider = () =>
-  serviceProvider().pipe(Layer.provide(Layer.mergeAll(ContainerProvider(), ContainerImageProvider())));
+/** The Service provider with its own Container lifecycle. */
+export const ServiceProvider = () => serviceProvider().pipe(Layer.provide(ContainerProvider()));

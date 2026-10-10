@@ -4,9 +4,10 @@ import * as Layer from "effect/Layer";
 import * as Config from "effect/Config";
 import * as Redacted from "effect/Redacted";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import * as Output from "alchemy/Output";
 import { packEnvValue } from "alchemy/RuntimeContext";
 import * as Test from "alchemy/Test/Bun";
@@ -18,22 +19,34 @@ const { test } = Test.make({ providers: testProviders() });
 const main = join(import.meta.dir, "fixtures", "service", "main.ts");
 
 let mock: ScalewayMock;
-let imageCommands: Scaleway.ContainerImageCommand[];
+let pushes: Scaleway.LayeredImageRequest[];
+let installs: string[];
+
+const fakeImageEngine: Scaleway.ServiceImageEngine = {
+  install: (directory) =>
+    Effect.sync(() => {
+      installs.push(directory);
+      mkdirSync(join(directory, "node_modules", "effect"), { recursive: true });
+      writeFileSync(join(directory, "node_modules", "effect", "index.js"), "installed");
+    }),
+  push: (request) =>
+    Effect.sync(() => {
+      pushes.push(request);
+      return { digest: `sha256:${request.layer.digest.slice(7, 19)}${"0".repeat(52)}` };
+    }),
+};
 
 beforeEach(() => {
   mock = installScalewayMock();
-  imageCommands = [];
+  pushes = [];
+  installs = [];
   process.env.SERVICE_FIXTURE_TOKEN = "fixture-secret";
   process.env.SERVICE_FIXTURE_REGION = "fr-par";
-  Scaleway.setContainerImageCommandRunner((command) =>
-    Effect.sync(() => {
-      imageCommands.push(command);
-    }),
-  );
+  Scaleway.setServiceImageEngine(fakeImageEngine);
 });
 
 afterEach(() => {
-  Scaleway.resetContainerImageCommandRunner();
+  Scaleway.resetServiceImageEngine();
   delete process.env.SERVICE_FIXTURE_TOKEN;
   delete process.env.SERVICE_FIXTURE_REGION;
   mock.restore();
@@ -42,7 +55,30 @@ afterEach(() => {
 const containerCreates = () =>
   mock.calls.filter((call) => call.method === "POST" && new URL(call.url).pathname.endsWith("/containers"));
 
-const builds = () => imageCommands.filter((command) => command.args[0] === "build");
+const builds = () => pushes;
+
+const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes).replace(/\0[\s\S]*$/, "");
+
+/** Path → content of every entry in a gzipped tar layer, following PAX `path` records. */
+const layerFiles = (data: Uint8Array) => {
+  const tar = gunzipSync(data);
+  const files = new Map<string, string>();
+  let paxPath: string | undefined;
+  for (let offset = 0; offset + 512 <= tar.length; ) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const size = Number.parseInt(text(header.subarray(124, 136)).trim() || "0", 8);
+    const body = tar.subarray(offset + 512, offset + 512 + size);
+    if (String.fromCharCode(header[156]!) === "x") {
+      paxPath = /\d+ path=(.*)\n/.exec(new TextDecoder().decode(body))?.[1];
+    } else {
+      files.set(paxPath ?? text(header.subarray(0, 100)), new TextDecoder().decode(body));
+      paxPath = undefined;
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return files;
+};
 const containerPatches = () =>
   mock.calls.filter((call) => call.method === "PATCH" && call.url.includes("/containers/"));
 
@@ -70,15 +106,19 @@ describe("Service", () => {
       expect(service.codeHash).toMatch(/^[a-f0-9]{16}$/);
       expect(service.url).toContain(".functions.fnc.fr-par.scw.cloud");
 
-      const build = imageCommands.find((command) => command.args[0] === "build");
-      const context = build?.args.at(-1) ?? "";
-      const dockerfile = readFileSync(join(context, "Dockerfile"), "utf8");
-      expect(dockerfile).toContain("FROM node:24-slim");
-      expect(dockerfile).toContain('ENTRYPOINT ["node", "/app/index.mjs"]');
-      expect(build?.args).toContain("linux/amd64");
-      const entry = readFileSync(join(context, "index.mjs"), "utf8");
-      expect(entry).toContain("Hetzner service");
-      expect(imageCommands.filter((command) => command.args[0] === "push")).toHaveLength(2);
+      expect(pushes).toHaveLength(1);
+      const push = pushes[0]!;
+      expect(push.base).toBe("node:24-slim");
+      expect(push.destination).toBe("rg.fr-par.scw.cloud/demo-registry/api");
+      expect(push.destTags).toEqual([service.imageRef.split(":").at(-1)!, "service"]);
+      expect(push.destAuth).toEqual({ username: "nologin", password: "test-secret" });
+      expect(push.platform).toEqual({ os: "linux", architecture: "amd64" });
+      expect(push.config).toEqual(Scaleway.serviceImageConfig(8080));
+      expect(service.imageDigest).toBe(`sha256:${push.layer.digest.slice(7, 19)}${"0".repeat(52)}`);
+      const files = layerFiles(push.layer.data);
+      expect(files.get("app/index.mjs")).toContain("Hetzner service");
+      expect(files.has("app/Dockerfile")).toBe(false);
+      expect(installs).toHaveLength(0);
 
       const body = JSON.parse(containerCreates().at(0)?.body ?? "{}");
       expect(body.image).toBe(service.imageRef);
@@ -138,6 +178,17 @@ describe("Service", () => {
     }),
   );
 
+  test.provider("installs build.install packages into the image layer", (stack) =>
+    Effect.gen(function* () {
+      yield* stack.deploy(deployService({}, { build: { install: ["effect"] } }));
+
+      expect(installs).toHaveLength(1);
+      const files = layerFiles(pushes[0]!.layer.data);
+      expect(JSON.parse(files.get("app/package.json")!).dependencies.effect).toMatch(/^\d/);
+      expect(files.get("app/node_modules/effect/index.js")).toBe("installed");
+    }),
+  );
+
   test.provider("rotating a secret value redeploys without rebuilding", (stack) =>
     Effect.gen(function* () {
       yield* stack.deploy(deployService({ TOKEN: Redacted.make("first") }));
@@ -148,16 +199,17 @@ describe("Service", () => {
     }),
   );
 
-  test.provider("a failed image build fails the deploy before any container exists", (stack) =>
+  test.provider("a failed image push fails the deploy before any container exists", (stack) =>
     Effect.gen(function* () {
-      Scaleway.setContainerImageCommandRunner((command) =>
-        command.args[0] === "build" ? Effect.fail(new Error("docker build failed")) : Effect.void,
-      );
+      Scaleway.setServiceImageEngine({
+        ...fakeImageEngine,
+        push: () => Effect.fail(new Error("registry push failed")),
+      });
 
       const exit = yield* Effect.exit(stack.deploy(deployService()));
 
       expect(exit._tag).toBe("Failure");
-      expect(String(exit)).toContain("docker build failed");
+      expect(String(exit)).toContain("registry push failed");
       expect(containerCreates()).toHaveLength(0);
     }),
   );
@@ -228,36 +280,15 @@ describe("Service with module-scope resources", () => {
   );
 });
 
-describe("generateServiceDockerfile", () => {
-  unitTest("installs, copies chunks and deduplicates extra files only when needed", () => {
-    const minimal = Scaleway.generateServiceDockerfile({}, false, false);
-    expect(minimal).not.toContain("npm install");
-    expect(minimal).not.toContain("COPY *.js");
-    expect(minimal).toContain("ENV PORT=8080");
-
-    const full = Scaleway.generateServiceDockerfile(
-      {
-        image: "node:24-alpine",
-        port: 3000,
-        extraFiles: [
-          { source: "a", dest: "public" },
-          { source: "b", dest: "public" },
-          { source: "c", dest: "." },
-        ],
-      },
-      true,
-      true,
-    );
-    expect(full.split("\n").slice(0, 4)).toEqual([
-      "FROM node:24-alpine",
-      "WORKDIR /app",
-      "COPY package.json /app/package.json",
-      "RUN npm install --omit=dev --no-fund --no-audit",
-    ]);
-    expect(full).toContain("COPY *.js /app/");
-    expect(full.match(/COPY public /g)).toHaveLength(1);
-    expect(full).not.toContain("COPY . ");
-    expect(full).toContain("EXPOSE 3000");
+describe("serviceImageConfig", () => {
+  unitTest("runs the bundled entry from /app on the service port", () => {
+    expect(Scaleway.serviceImageConfig(3000)).toEqual({
+      env: { PORT: "3000", HOST: "0.0.0.0", NODE_ENV: "production" },
+      workingDir: "/app",
+      entrypoint: ["node", "/app/index.mjs"],
+      cmd: null,
+      exposedPorts: ["3000/tcp"],
+    });
   });
 });
 

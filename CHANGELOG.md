@@ -9,6 +9,8 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 - `Service`: an Effect-native platform hosting a bundled program as a
   Serverless Container, with init-time config and Outputs bound into its
   (secret) environment, composed from `ContainerImage` and `Container`.
+  Its image is built without Docker: one deterministic layer on a base
+  image, pushed over the registry API (`pushLayeredImage`, `imageLayer`).
   Env-only changes and secret rotation redeploy without rebuilding the image.
 - `smoke:scaleway:service`: an opt-in live smoke test for `Service`.
 
