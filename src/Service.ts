@@ -1,21 +1,21 @@
 import { AlchemyContext } from "alchemy/AlchemyContext";
-import * as Bundle from "alchemy/Bundle/Bundle";
-import {
-  matchesPackageRoot,
-  normalizeInstallTargets,
-  resolvePackageInstallIdentity,
-  type PackageInstall,
-} from "alchemy/Bundle/InstalledPackages";
-import { findCwdForBundle, getStableContextDir, resolveMainPath } from "alchemy/Bundle/TempRoot";
+import * as Bundle from "alchemy/Bundle";
 import { isResolved } from "alchemy/Diff";
 import { Platform, type Main, type PlatformProps } from "alchemy/Platform";
 import * as Provider from "alchemy/Provider";
 import type { Resource } from "alchemy/Resource";
-import { createContainerRuntimeContext, type HostRuntimeContext, type ServerHost } from "alchemy/Server/Process";
+import { unpackEnvValue } from "alchemy/RuntimeContext";
+import { createContainerRuntimeContext, type HostRuntimeContext, type ServerHost } from "alchemy/Server";
 import { Stack } from "alchemy/Stack";
 import { Stage } from "alchemy/Stage";
-import { copyExtraFiles, extraFileDestination, hashExtraFiles, isContextRootDest, type ExtraFile } from "alchemy/Util/extraFiles";
-import { sha256Object } from "alchemy/Util/sha256";
+import {
+  copyExtraFiles,
+  extraFileDestination,
+  hashExtraFiles,
+  isContextRootDest,
+  sha256Object,
+  type ExtraFile,
+} from "alchemy/Util";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
@@ -29,7 +29,13 @@ import {
   type ContainerPrivacy,
   type ContainerProps,
 } from "./Container.ts";
-import { ContainerImage, ContainerImageProvider, type ContainerImageRegistryRef } from "./ContainerImage.ts";
+import {
+  ContainerImage,
+  ContainerImageProvider,
+  registryPrefix,
+  type ContainerImageRegistryRef,
+} from "./ContainerImage.ts";
+import { ScalewayError } from "./Errors.ts";
 import type { NamedNamespace } from "./Internal.ts";
 import type { Providers } from "./Providers.ts";
 
@@ -51,7 +57,7 @@ export interface ServiceBuildOptions extends Bundle.BundleConfig {
    * Packages installed into the image with `npm install` instead of bundled.
    * CommonJS drivers such as `pg` belong here.
    */
-  readonly install?: PackageInstall;
+  readonly install?: Bundle.PackageInstall;
 }
 
 /**
@@ -114,6 +120,9 @@ export type ServiceServices = ServerHost;
 export type ServiceShape = Main<ServiceServices>;
 export type ServiceRuntimeContext = HostRuntimeContext;
 
+const resolveRef = <T>(value: ServiceRef<T>) =>
+  Effect.isEffect(value) ? (value as Effect.Effect<T, never, Providers>) : Effect.succeed(value);
+
 /**
  * An Effect program running as a Scaleway Serverless Container.
  *
@@ -135,9 +144,6 @@ export type ServiceRuntimeContext = HostRuntimeContext;
  *
  * @resource
  */
-const resolveRef = <T>(value: ServiceRef<T>) =>
-  Effect.isEffect(value) ? (value as Effect.Effect<T, never, Providers>) : Effect.succeed(value);
-
 export const Service: Platform<Service, ServiceServices, ServiceShape, ServiceRuntimeContext> = Platform(
   "Scaleway.Service",
   {
@@ -163,18 +169,20 @@ export const Service: Platform<Service, ServiceServices, ServiceShape, ServiceRu
   },
 );
 
-class UnresolvedServiceProp extends Error {}
-
 /** Props reach the provider after `transformProps`; an Effect here is a defect. */
-const resolved = <T>(value: ServiceRef<T>, name: string): T => {
-  if (Effect.isEffect(value)) throw new UnresolvedServiceProp(`Scaleway.Service ${name} was not resolved at plan time`);
-  return value as T;
-};
+const resolved = <T>(value: ServiceRef<T>, name: string): Effect.Effect<T> =>
+  Effect.isEffect(value)
+    ? Effect.die(
+        new ScalewayError({
+          message: `Scaleway.Service ${name} was not resolved at plan time`,
+          operation: "Scaleway.Service",
+          resource: name,
+        }),
+      )
+    : Effect.succeed(value as T);
 
-const REDACTED_MARKER = '{"_tag":"Redacted"';
-
-/** A packed RuntimeContext binding whose value was `Redacted`. */
-const isPackedSecret = (value: string) => value.startsWith(REDACTED_MARKER);
+/** A RuntimeContext binding that `packEnvValue` packed from a `Redacted` value. */
+const isPackedSecret = (value: string) => Redacted.isRedacted(unpackEnvValue(value));
 
 const plainValue = (value: unknown): string | undefined => {
   if (value === undefined || value === null) return undefined;
@@ -259,14 +267,26 @@ const matchesExternal = (
   return matchers.some((matcher) => (typeof matcher === "string" ? matcher === moduleId : matcher.test(moduleId)));
 };
 
+/** The props that determine the image contents and therefore the code hash. */
+export type ServiceCodeProps = Pick<ServiceProps, "main" | "handler" | "build" | "image" | "port" | "extraFiles">;
+
+const codePropsOf = (props: ServiceProps): ServiceCodeProps => ({
+  main: props.main,
+  handler: props.handler,
+  build: props.build,
+  image: props.image,
+  port: props.port,
+  extraFiles: props.extraFiles,
+});
+
 const makeServiceBundler = Effect.gen(function* () {
   const { dotAlchemy } = yield* AlchemyContext;
   const virtualEntryPlugin = yield* Bundle.virtualEntryPlugin;
 
-  const bundle = Effect.fn(function* (props: ServiceProps) {
-    const realMain = yield* resolveMainPath(props.main);
-    const cwd = yield* findCwdForBundle(realMain);
-    const requested = yield* normalizeInstallTargets(props.build?.install);
+  const bundle = Effect.fn(function* (props: ServiceCodeProps) {
+    const realMain = yield* Bundle.resolveMainPath(props.main);
+    const cwd = yield* Bundle.findCwdForBundle(realMain);
+    const requested = yield* Bundle.normalizeInstallTargets(props.build?.install);
     const installRoots = Object.keys(requested);
     const configuredExternal = props.build?.input?.external;
     const output = yield* Bundle.build(
@@ -276,8 +296,8 @@ const makeServiceBundler = Effect.gen(function* () {
         cwd,
         platform: "node",
         external: (moduleId, parentId, isResolvedId) =>
-          SERVICE_DEFAULT_EXTERNALS.some((root) => matchesPackageRoot(moduleId, root)) ||
-          installRoots.some((root) => matchesPackageRoot(moduleId, root)) ||
+          SERVICE_DEFAULT_EXTERNALS.some((root) => Bundle.matchesPackageRoot(moduleId, root)) ||
+          installRoots.some((root) => Bundle.matchesPackageRoot(moduleId, root)) ||
           matchesExternal(configuredExternal, moduleId, parentId, isResolvedId),
         resolve: {
           conditionNames: [...Bundle.NODE_CONDITION_NAMES],
@@ -296,7 +316,7 @@ const makeServiceBundler = Effect.gen(function* () {
       props.build,
     );
     const identity =
-      installRoots.length > 0 ? yield* resolvePackageInstallIdentity({ cwd, requested }) : undefined;
+      installRoots.length > 0 ? yield* Bundle.resolvePackageInstallIdentity({ cwd, requested }) : undefined;
     const install =
       identity !== undefined && Object.keys(identity.resolved).length > 0 ? identity.resolved : undefined;
     const files = output.files.map((file, index) => ({
@@ -314,12 +334,15 @@ const makeServiceBundler = Effect.gen(function* () {
     return { realMain, files, dockerfile, packageJson, codeHash };
   });
 
-  /** Write the Docker context for `props` and return its directory and code hash. */
-  const materialize = Effect.fn(function* (id: string, props: ServiceProps) {
+  /** Write the Docker context for a bundled program and return its directory. */
+  const materialize = Effect.fn(function* (
+    id: string,
+    bundled: Effect.Success<ReturnType<typeof bundle>>,
+    extraFiles: ServiceProps["extraFiles"],
+  ) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const bundled = yield* bundle(props);
-    const context = yield* getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-image`);
+    const context = yield* Bundle.getStableContextDir(bundled.realMain, dotAlchemy, `${id}-service-image`);
     yield* fs.remove(context, { recursive: true }).pipe(Effect.ignore);
     yield* fs.makeDirectory(context, { recursive: true });
     for (const file of bundled.files) {
@@ -331,18 +354,18 @@ const makeServiceBundler = Effect.gen(function* () {
     if (bundled.packageJson !== undefined) {
       yield* fs.writeFileString(path.join(context, "package.json"), bundled.packageJson);
     }
-    yield* copyExtraFiles(context, props.extraFiles);
-    return { context, codeHash: bundled.codeHash };
+    yield* copyExtraFiles(context, extraFiles);
+    return context;
   });
 
   return { bundle, materialize };
 });
 
-const containerPropsOf = (
+const containerPropsOf = Effect.fnUntraced(function* (
   props: ServiceProps,
   image: { ref: string; digest: string },
   runtimeEnv: Record<string, string>,
-): ContainerProps => {
+) {
   const port = props.port ?? DEFAULT_SERVICE_PORT;
   const { environmentVariables, secretEnvironmentVariables } = splitServiceEnvironment({
     ...props.env,
@@ -350,7 +373,7 @@ const containerPropsOf = (
     PORT: String(port),
   });
   return {
-    namespace: resolved(props.namespace, "namespace"),
+    namespace: yield* resolved(props.namespace, "namespace"),
     name: props.name,
     description: props.description,
     image: image.ref,
@@ -366,8 +389,8 @@ const containerPropsOf = (
     privacy: props.privacy,
     httpsConnectionsOnly: props.httpsConnectionsOnly,
     domains: props.domains,
-  };
-};
+  } satisfies ContainerProps;
+});
 
 // @crap-ignore: provider factory wraps lifecycle closures scored separately.
 const serviceProvider = () =>
@@ -385,23 +408,31 @@ const serviceProvider = () =>
         ALCHEMY_PHASE: "runtime",
       };
       const imageId = (id: string) => `${id}Image`;
-      const imageProps = (id: string, props: ServiceProps, context: string) => ({
-        registry: resolved(props.registry, "registry"),
-        context,
-        repository: props.repository ?? id.toLowerCase(),
-        tag: "service",
-        platform: SERVICE_PLATFORM,
+      const repositoryOf = (id: string, props: ServiceProps) => props.repository ?? id.toLowerCase();
+      /** The image already pushed for this code, registry and repository, if any. */
+      const reusableImage = Effect.fnUntraced(function* (
+        id: string,
+        props: ServiceProps,
+        codeHash: string,
+        output: Service["Attributes"] | undefined,
+      ) {
+        if (output === undefined || output.codeHash !== codeHash) return undefined;
+        const registry = yield* registryPrefix(yield* resolved(props.registry, "registry"));
+        const previous = output.containerImage;
+        return previous.registry === registry && previous.repository === repositoryOf(id, props) ? previous : undefined;
       });
+      const deployedImage = (output: Service["Attributes"]) => ({ ref: output.imageRef, digest: output.imageDigest });
 
       return Service.Provider.of({
         stables: ["containerId", "namespaceId"],
         list: () => Effect.succeed([]),
-        diff: Effect.fnUntraced(function* ({ news, olds, output }) {
-          if (!isResolved(news) || !output) return undefined;
-          const { codeHash } = yield* bundler.bundle(news);
-          if (codeHash !== output.codeHash) return { action: "update" } as const;
-          if (JSON.stringify(olds) !== JSON.stringify(news)) return { action: "update" } as const;
-          return undefined;
+        diff: Effect.fnUntraced(function* ({ news, output }) {
+          if (!output) return undefined;
+          // By diff time the effect-config form is evaluated; only the code props need to be resolved.
+          const code = codePropsOf(news as ServiceProps);
+          if (!isResolved(code)) return undefined;
+          const { codeHash } = yield* bundler.bundle(code);
+          return codeHash === output.codeHash ? undefined : ({ action: "update" } as const);
         }),
         read: Effect.fnUntraced(function* ({ id, fqn, instanceId, olds, output }) {
           if (!output) return undefined;
@@ -409,31 +440,39 @@ const serviceProvider = () =>
             id,
             fqn,
             instanceId,
-            olds: containerPropsOf(olds, { ref: output.imageRef, digest: output.imageDigest }, runtimeEnv),
+            olds: yield* containerPropsOf(olds, deployedImage(output), runtimeEnv),
             output,
           });
           return container === undefined ? undefined : { ...output, ...container };
         }),
         reconcile: Effect.fnUntraced(function* ({ id, fqn, instanceId, news, olds, output, session }) {
           yield* session.note(`Bundling ${id} program...`);
-          const { context, codeHash } = yield* bundler.materialize(id, news);
-          const image = yield* images.reconcile({
-            id: imageId(id),
-            fqn: imageId(fqn),
-            instanceId,
-            news: imageProps(id, news, context),
-            olds: undefined,
-            output: output?.containerImage,
-            session,
-            bindings: [],
-          });
+          const bundled = yield* bundler.bundle(codePropsOf(news));
+          const codeHash = bundled.codeHash;
+          const image =
+            (yield* reusableImage(id, news, codeHash, output)) ??
+            (yield* images.reconcile({
+              id: imageId(id),
+              fqn: imageId(fqn),
+              instanceId,
+              news: {
+                registry: yield* resolved(news.registry, "registry"),
+                context: yield* bundler.materialize(id, bundled, news.extraFiles),
+                repository: repositoryOf(id, news),
+                tag: "service",
+                platform: SERVICE_PLATFORM,
+              },
+              olds: undefined,
+              output: output?.containerImage,
+              session,
+              bindings: [],
+            }));
           const container = yield* containers.reconcile({
             id,
             fqn,
             instanceId,
-            news: containerPropsOf(news, image, runtimeEnv),
-            olds:
-              olds && output ? containerPropsOf(olds, { ref: output.imageRef, digest: output.imageDigest }, runtimeEnv) : undefined,
+            news: yield* containerPropsOf(news, image, runtimeEnv),
+            olds: olds && output ? yield* containerPropsOf(olds, deployedImage(output), runtimeEnv) : undefined,
             output,
             session,
             bindings: [],
@@ -445,7 +484,7 @@ const serviceProvider = () =>
             id,
             fqn,
             instanceId,
-            olds: containerPropsOf(olds, { ref: output.imageRef, digest: output.imageDigest }, runtimeEnv),
+            olds: yield* containerPropsOf(olds, deployedImage(output), runtimeEnv),
             output,
             session,
             bindings: [],

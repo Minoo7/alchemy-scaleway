@@ -9,6 +9,8 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 - `Service`: an Effect-native platform hosting a bundled program as a
   Serverless Container, with init-time config and Outputs bound into its
   (secret) environment, composed from `ContainerImage` and `Container`.
+  Env-only changes and secret rotation redeploy without rebuilding the image.
+- `smoke:scaleway:service`: an opt-in live smoke test for `Service`.
 
 ### Changed
 
@@ -22,6 +24,8 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 - `InstanceKnownHosts` imports `ssh2` through its default export so the
   package loads under Node's ESM loader, which cannot name `utils` or
   `Client` from the CommonJS module.
+- `InstanceKnownHosts` loads `ssh2` lazily, so importing the package does not
+  load `ssh2`'s optional native `cpu-features` binding.
 
 ## [0.8.0-beta.80] - 2026-10-03
 

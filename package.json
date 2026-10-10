@@ -50,6 +50,7 @@
     "smoke:scaleway:dns": "bun run scripts/scaleway-dns-smoke.ts",
     "smoke:scaleway:registry-copy": "bun run scripts/scaleway-registry-copy-smoke.ts",
     "smoke:scaleway:negative": "bun run scripts/scaleway-negative-flexible-ip-smoke.ts",
+    "smoke:scaleway:service": "bun run scripts/scaleway-service-smoke.ts",
     "test": "bun test",
     "format": "oxfmt .",
     "prepublishOnly": "bun run check && bun test && bun run coverage && bun run crap",

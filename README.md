@@ -162,7 +162,15 @@ The DNS smoke test is also separate and does not run the full production smoke s
 SCW_LIVE_DNS_TEST=1 op run --environment <1password-environment-id> -- bun run smoke:scaleway:dns
 ```
 
-It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_SMOKE_DNS_ZONE`, optional `SCW_DNS_SMOKE_ZONE`, `SCW_DEFAULT_ZONE`, `SCW_API_URL`, `SCW_NEGATIVE_SMOKE_RUN_ID`, `SCW_NEGATIVE_SMOKE_STAGE`, `SCW_NEGATIVE_SMOKE_PREFIX`, and `SCW_NEGATIVE_SMOKE_REVERSE`.
+The `Service` smoke test deploys `scripts/smoke-service/main.ts` into a temporary container and registry namespace, fetches it until it answers with its bound secret and plain environment value, redeploys unchanged and checks the image did not change, then destroys the stack and fails on leaked containers. It needs a local Docker daemon:
+
+```sh
+SCW_LIVE_SERVICE_TEST=1 op run --environment <1password-environment-id> -- bun run smoke:scaleway:service
+```
+
+It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, optional `SCW_DEFAULT_REGION`, `SCW_API_URL`, `SCW_SERVICE_SMOKE_RUN_ID`, `SCW_SERVICE_SMOKE_STAGE` and `SCW_SERVICE_SMOKE_PREFIX`.
+
+The DNS smoke test reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_SMOKE_DNS_ZONE`, optional `SCW_DNS_SMOKE_ZONE`, `SCW_DEFAULT_ZONE`, `SCW_API_URL`, `SCW_NEGATIVE_SMOKE_RUN_ID`, `SCW_NEGATIVE_SMOKE_STAGE`, `SCW_NEGATIVE_SMOKE_PREFIX`, and `SCW_NEGATIVE_SMOKE_REVERSE`.
 
 ## Usage
 
@@ -298,7 +306,7 @@ Remote state requires `SCW_ACCESS_KEY` plus `SCW_SECRET_KEY`. `SCW_DEFAULT_PROJE
 - `Container` - Scaleway Serverless Container lifecycle with deployment readiness polling, optional custom domains, and optional cron triggers.
 - `ContainerImage` - Local Docker image build and push lifecycle for Scaleway Container Registry. It logs in with `SCW_SECRET_KEY`, runs `docker build`, runs `docker push`, returns content-tagged `ref` plus requested-tag `stableRef`, and can feed `Container.image` directly.
 - `ContainerImageMirror` - Copies an existing remote image (such as a private `ghcr.io` image) into a Scaleway Container Registry namespace using a built-in pure-TypeScript registry client (no external binary, no Docker daemon), preserving the multi-arch manifest. It resolves the source digest, pushes a content-derived `ref` plus a requested-tag `stableRef`, and exposes `ref`/`stableRef`/`digest` for `Container.image`.
-- `Service` - An Effect program hosted as a Serverless Container, the Scaleway counterpart of Alchemy's `Fly.Service` and `Railway.Service`. `main` is bundled with rolldown and Alchemy's Node bootstrap into a content-addressed image (`build.install` for CommonJS drivers such as `pg`, `extraFiles` for static assets), pushed to the given `registry` through `ContainerImage`, and deployed through `Container`. Config and resource Outputs yielded in the program's init are bound into the container: Alchemy binds them as `Redacted`, so they travel as secret environment variables; plain `env` values stay plain. Unchanged programs and props skip the build and deploy.
+- `Service` - An Effect program hosted as a Serverless Container, the Scaleway counterpart of Alchemy's `Fly.Service` and `Railway.Service`. `main` is bundled with rolldown and Alchemy's Node bootstrap into a content-addressed image (`build.install` for CommonJS drivers such as `pg`, `extraFiles` for static assets), pushed to the given `registry` through `ContainerImage`, and deployed through `Container`. Config and resource Outputs yielded in the program's init are bound into the container: Alchemy binds them as `Redacted`, so they travel as secret environment variables; plain `env` values stay plain. Unchanged programs and props skip the build and deploy; env-only changes and secret rotation redeploy the container with the already-pushed image.
 - `Trigger` - Container trigger lifecycle (cron, SQS, or NATS source).
 - `Domain` - Container custom domain lifecycle. Set `waitForCname: true` when the stack also creates the CNAME and Scaleway should wait for DNS visibility before custom-domain creation.
 - `FunctionNamespace` - Scaleway Serverless Functions namespace lifecycle under the Functions v1beta1 API.
