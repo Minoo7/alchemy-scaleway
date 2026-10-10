@@ -8,11 +8,14 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 - `Service`: an Effect-native platform hosting a bundled program as a
   Serverless Container, with init-time config and Outputs bound into its
-  (secret) environment, composed from `ContainerImage` and `Container`.
+  (secret) environment, deployed through `Container`.
   Like `Fly.Service`, its image comes from a generated Dockerfile built and
   pushed with Alchemy's `Docker` service.
   Env-only changes and secret rotation redeploy without rebuilding the image.
 - `smoke:scaleway:service`: an opt-in live smoke test for `Service`.
+- Non-interactive profile configuration: `alchemy profile edit --add Scaleway
+  --method stored --set secretKey=env:SCW_SECRET_KEY ...` (and `--method env`),
+  with field validation before anything is written.
 
 ### Changed
 
@@ -28,6 +31,10 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
   `Client` from the CommonJS module.
 - `InstanceKnownHosts` loads `ssh2` lazily, so importing the package does not
   load `ssh2`'s optional native `cpu-features` binding.
+- Loading a stack's providers for a profile without Scaleway credentials no
+  longer fails with `Could not load auth providers`. Credential resolution now
+  surfaces Alchemy's `MissingProviderConfig` unwrapped, so `alchemy profile
+  edit --add Scaleway` works for a fresh profile.
 
 ## [0.8.0-beta.80] - 2026-10-03
 
