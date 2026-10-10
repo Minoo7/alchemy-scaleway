@@ -26,6 +26,10 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 ### Fixed
 
+- `Scaleway.state()` now provides its own Scaleway API foundation
+  (credentials, clients, auth provider, profile and credential stores), so
+  `state: Scaleway.state()` works as documented, and it resolves credentials
+  on first use instead of while the stack loads.
 - `InstanceKnownHosts` imports `ssh2` through its default export so the
   package loads under Node's ESM loader, which cannot name `utils` or
   `Client` from the CommonJS module.
