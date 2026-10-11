@@ -4,6 +4,18 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 ## Unreleased
 
+### Added
+
+- `DatabaseEndpoint` attaches a `DatabaseInstance` to a Private Network
+  (IPAM by default, or a static `serviceIp`) and returns its private address.
+- `DatabaseInstance.publicEndpoint` removes or restores the public
+  load-balancer endpoint, and the `publicEndpoint` output reports whether it exists.
+
+### Fixed
+
+- `DatabaseInstance` public endpoint outputs now come from the load-balancer
+  endpoint instead of the first endpoint, which could be a Private Network endpoint.
+
 ## [0.8.0-beta.80] - 2026-10-03
 
 ### Changed

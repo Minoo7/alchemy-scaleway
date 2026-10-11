@@ -11,6 +11,7 @@ import { ContainerImage, ContainerImageProvider } from "../../src/ContainerImage
 import { ContainerImageMirror, ContainerImageMirrorProvider } from "../../src/ContainerImageMirror.ts";
 import { ScalewayClientsLive } from "../../src/Clients.ts";
 import { ScalewayCredentials } from "../../src/Credentials.ts";
+import { DatabaseEndpoint, DatabaseEndpointProvider } from "../../src/DatabaseEndpoint.ts";
 import { DatabaseInstance, DatabaseInstanceProvider } from "../../src/DatabaseInstance.ts";
 import { Domain, DomainProvider } from "../../src/Domain.ts";
 import { DnsRecord, DnsRecordProvider } from "../../src/DnsRecord.ts";
@@ -67,6 +68,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
       DnsRecord,
       RegistryNamespace,
       Secret,
+      DatabaseEndpoint,
       DatabaseInstance,
       Bucket,
       Vpc,
@@ -98,6 +100,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
         DnsRecordProvider(),
         RegistryNamespaceProvider(),
         SecretProvider(),
+        DatabaseEndpointProvider(),
         DatabaseInstanceProvider(),
         BucketProvider(),
         VpcProvider(),

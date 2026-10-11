@@ -63,7 +63,8 @@ Current resources:
 - `DnsRecord` - Scaleway Domains and DNS record set with resource target support.
 - `RegistryNamespace` - Scaleway Container Registry namespace.
 - `Secret` - Scaleway Secret Manager secret and value version lifecycle.
-- `DatabaseInstance` - Scaleway Managed Database for PostgreSQL/MySQL instance lifecycle with redacted admin password input.
+- `DatabaseInstance` - Scaleway Managed Database for PostgreSQL/MySQL instance lifecycle with redacted admin password input and an optional public endpoint (`publicEndpoint`).
+- `DatabaseEndpoint` - Private Network endpoint on a `DatabaseInstance`; replaced delete-first because Scaleway allows one per instance, and reported `Unowned` when found without state because endpoints carry no ownership metadata.
 - `Bucket` - Scaleway Object Storage bucket via S3-compatible API.
 - `Vpc` - Scaleway VPC lifecycle with one-way routing and custom route propagation enablement.
 - `PrivateNetwork` - Scaleway Private Network with optional VPC binding, subnets, DHCP, and default route propagation.

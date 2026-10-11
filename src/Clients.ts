@@ -281,13 +281,31 @@ export interface ScalewaySecretVersionRecord {
   region?: string;
 }
 
+export interface ScalewayRdbEndpointPrivateNetworkRecord {
+  private_network_id: string;
+  service_ip?: string;
+  zone?: string;
+  provisioning_mode?: string;
+}
+
 export interface ScalewayRdbEndpointRecord {
+  id?: string;
   ip?: string;
   port?: number;
   name?: string | null;
   hostname?: string;
-  private_network?: { id?: string } | null;
+  private_network?: ScalewayRdbEndpointPrivateNetworkRecord | null;
+  load_balancer?: Record<string, never> | null;
+  direct_access?: Record<string, never> | null;
 }
+
+export type ScalewayRdbEndpointSpec =
+  | { load_balancer: Record<string, never> }
+  | {
+      private_network:
+        | { private_network_id: string; service_ip: string }
+        | { private_network_id: string; ipam_config: Record<string, never> };
+    };
 
 export interface ScalewayRdbVolumeRecord {
   type?: string;
@@ -638,6 +656,9 @@ export interface ScalewayClientsShape {
     getInstance(input: { region: string; instanceId: string }): Effect.Effect<ScalewayRdbInstanceRecord, ScalewayError>;
     updateInstance(input: { region: string; instanceId: string } & Record<string, unknown>): Effect.Effect<ScalewayRdbInstanceRecord, ScalewayError>;
     deleteInstance(input: { region: string; instanceId: string }): Effect.Effect<void, ScalewayError>;
+    createEndpoint(input: { region: string; instanceId: string; endpointSpec: ScalewayRdbEndpointSpec }): Effect.Effect<ScalewayRdbEndpointRecord & { id: string }, ScalewayError>;
+    getEndpoint(input: { region: string; endpointId: string }): Effect.Effect<ScalewayRdbEndpointRecord & { id: string }, ScalewayError>;
+    deleteEndpoint(input: { region: string; endpointId: string }): Effect.Effect<void, ScalewayError>;
   };
   objectStorage: {
     createBucket(input: {
@@ -1096,6 +1117,14 @@ export function buildScalewayClients(credentials: ScalewayCredentialsService): S
         request("PATCH", `/rdb/v1/regions/${region}/instances/${instanceId}`, input).pipe(Effect.map(decodeRdbInstance)),
       deleteInstance: ({ region, instanceId }) =>
         request<void>("DELETE", `/rdb/v1/regions/${region}/instances/${instanceId}`),
+      createEndpoint: ({ region, instanceId, endpointSpec }) =>
+        request("POST", `/rdb/v1/regions/${region}/instances/${instanceId}/endpoints`, { endpoint_spec: endpointSpec }).pipe(
+          Effect.map(decodeRdbEndpoint),
+        ),
+      getEndpoint: ({ region, endpointId }) =>
+        request("GET", `/rdb/v1/regions/${region}/endpoints/${endpointId}`).pipe(Effect.map(decodeRdbEndpoint)),
+      deleteEndpoint: ({ region, endpointId }) =>
+        request<void>("DELETE", `/rdb/v1/regions/${region}/endpoints/${endpointId}`),
     },
     objectStorage,
     vpc: {
@@ -1628,6 +1657,7 @@ const decodeRdbInstance = (value: unknown) =>
   typeof value === "object" && value !== null && "instance" in value
     ? envelope<ScalewayRdbInstanceRecord>(value, "instance")
     : value as ScalewayRdbInstanceRecord;
+const decodeRdbEndpoint = (value: unknown) => envelope<ScalewayRdbEndpointRecord & { id: string }>(value, "endpoint");
 const envelope = <T>(value: unknown, key: string) =>
   typeof value === "object" && value !== null && key in value
     ? ((value as Record<string, unknown>)[key] as T)

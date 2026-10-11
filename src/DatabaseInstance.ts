@@ -5,7 +5,7 @@ import { isResolved } from "alchemy/Diff";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { makeScalewayClients, type ScalewayRdbInstanceRecord } from "./Clients.ts";
+import { makeScalewayClients, type ScalewayClientsShape, type ScalewayRdbEndpointRecord, type ScalewayRdbInstanceRecord } from "./Clients.ts";
 import { isNotFound, ScalewayError } from "./Errors.ts";
 import { omitUndefined, physicalName, projectId, projectInput, withManagedProjectDefault, type ProjectRef } from "./Internal.ts";
 import type { Providers } from "./Providers.ts";
@@ -33,6 +33,12 @@ export interface DatabaseInstanceProps {
   volumeSize?: number;
   backupSchedule?: DatabaseBackupSchedule;
   backupSameRegion?: boolean;
+  /**
+   * Keep the public load-balancer endpoint. Defaults to `true`. Set `false` to
+   * remove it so the instance is reachable only through a `DatabaseEndpoint`
+   * on a Private Network; Scaleway allowed-IP rules cover only the public endpoint.
+   */
+  publicEndpoint?: boolean;
 }
 
 export type DatabaseInstance = Resource<
@@ -55,6 +61,9 @@ export type DatabaseInstance = Resource<
       frequencyHours?: number;
       retentionDays?: number;
     };
+    /** Whether the public load-balancer endpoint exists. */
+    publicEndpoint?: boolean;
+    /** Public endpoint address; absent when the public endpoint is removed. */
     endpointIp?: string;
     endpointPort?: number;
     endpointHostname?: string;
@@ -71,10 +80,70 @@ export const DatabaseInstance = withManagedProjectDefault(Resource<DatabaseInsta
   defaultRemovalPolicy: "retain",
 }));
 
-class DatabaseInstanceFailed extends Data.TaggedError("Scaleway.DatabaseInstanceFailed")<{
+export class DatabaseInstanceFailed extends Data.TaggedError("Scaleway.DatabaseInstanceFailed")<{
   databaseInstanceId: string;
   status: string;
 }> {}
+
+type RdbClient = ScalewayClientsShape["rdb"];
+type Session = { note(message: string): Effect.Effect<void> };
+
+const DATABASE_POLL_INTERVAL = "5 seconds";
+const DATABASE_BUSY_ATTEMPTS = 120;
+
+/** Poll until the instance reports `ready`; endpoint and settings changes are refused (409) until then. */
+export function waitForDatabaseReady(
+  rdb: RdbClient,
+  region: string,
+  instanceId: string,
+  session: Session,
+): Effect.Effect<ScalewayRdbInstanceRecord, ScalewayError | DatabaseInstanceFailed> {
+  return Effect.gen(function* () {
+    while (true) {
+      const record = yield* rdb.getInstance({ region, instanceId });
+      const status = record.status?.toLowerCase();
+      if (!status || status === "ready") return record;
+      if (status === "error" || status === "locked") {
+        return yield* new DatabaseInstanceFailed({ databaseInstanceId: instanceId, status: record.status ?? "unknown" });
+      }
+      yield* session.note(`waiting database ready status=${record.status ?? "unknown"}`);
+      yield* Effect.sleep(DATABASE_POLL_INTERVAL);
+    }
+  });
+}
+
+/**
+ * Run an instance-scoped change once the instance is ready, retrying while
+ * Scaleway still reports a transient state (409), e.g. a backup that started
+ * between the readiness poll and the request.
+ */
+export function whenDatabaseReady<A>(
+  rdb: RdbClient,
+  region: string,
+  instanceId: string,
+  session: Session,
+  change: Effect.Effect<A, ScalewayError>,
+): Effect.Effect<A, ScalewayError | DatabaseInstanceFailed> {
+  return Effect.gen(function* () {
+    for (let attempt = 1; attempt < DATABASE_BUSY_ATTEMPTS; attempt++) {
+      yield* waitForDatabaseReady(rdb, region, instanceId, session);
+      const result = yield* change.pipe(
+        Effect.map((value) => ({ value })),
+        Effect.catchIf(isTransientState, () => Effect.succeed(undefined)),
+      );
+      if (result) return result.value;
+      yield* session.note("waiting database transient state status=409");
+      yield* Effect.sleep(DATABASE_POLL_INTERVAL);
+    }
+    yield* waitForDatabaseReady(rdb, region, instanceId, session);
+    return yield* change;
+  });
+}
+
+const isPublicEndpoint = (endpoint: ScalewayRdbEndpointRecord) => endpoint.load_balancer != null;
+
+const publicEndpointOf = (record: ScalewayRdbInstanceRecord) =>
+  record.endpoints ? record.endpoints.find(isPublicEndpoint) : record.endpoint ?? undefined;
 
 const DEFAULT_VOLUME_TYPE: DatabaseVolumeType = "lssd";
 const withAlchemyTag = (id: string, tags: string[] | undefined) => [`alchemy:logical-id=${id}`, ...(tags ?? [])];
@@ -112,8 +181,9 @@ export const DatabaseInstanceProvider = () =>
     Effect.gen(function* () {
       const clients = yield* (yield* makeScalewayClients);
       const nameOf = (id: string, name?: string) => physicalName(id, name, { maxLength: 63 });
-      const toAttributes = (record: ScalewayRdbInstanceRecord): DatabaseInstance["Attributes"] =>
-        omitUndefined({
+      const toAttributes = (record: ScalewayRdbInstanceRecord): DatabaseInstance["Attributes"] => {
+        const publicEndpoint = publicEndpointOf(record);
+        return omitUndefined({
           databaseInstanceId: record.id,
           name: record.name,
           projectId: record.project_id,
@@ -132,30 +202,43 @@ export const DatabaseInstanceProvider = () =>
                 retentionDays: record.backup_schedule.retention,
               })
             : undefined,
-          endpointIp: record.endpoint?.ip ?? record.endpoints?.[0]?.ip,
-          endpointPort: record.endpoint?.port ?? record.endpoints?.[0]?.port,
-          endpointHostname: record.endpoint?.hostname ?? record.endpoints?.[0]?.hostname,
+          publicEndpoint: publicEndpoint !== undefined,
+          endpointIp: publicEndpoint?.ip,
+          endpointPort: publicEndpoint?.port,
+          endpointHostname: publicEndpoint?.hostname,
           createdAt: record.created_at,
           updatedAt: record.updated_at,
           _alchemyLogicalId: alchemyLogicalId(record.tags),
         }) as DatabaseInstance["Attributes"];
+      };
 
-      const waitForReady = (databaseInstanceId: string, session: { note(message: string): Effect.Effect<void> }): Effect.Effect<DatabaseInstance["Attributes"], unknown> =>
+      const waitForReady = (databaseInstanceId: string, session: Session) =>
+        waitForDatabaseReady(clients.rdb, clients.region, databaseInstanceId, session).pipe(Effect.map(toAttributes));
+
+      const ensurePublicEndpoint = (region: string, databaseInstanceId: string, wanted: boolean, session: Session) =>
         Effect.gen(function* () {
-          while (true) {
-            const record = yield* clients.rdb.getInstance({ region: clients.region, instanceId: databaseInstanceId });
-            const status = record.status?.toLowerCase();
-            if (!status || status === "ready") return toAttributes(record);
-            if (status === "error" || status === "locked") {
-              return yield* new DatabaseInstanceFailed({
-                databaseInstanceId,
-                status: record.status ?? "unknown",
-              });
-            }
-            yield* session.note(`waiting database ready status=${record.status ?? "unknown"}`);
-            yield* Effect.sleep("5 seconds");
+          const record = yield* waitForDatabaseReady(clients.rdb, region, databaseInstanceId, session);
+          const existing = publicEndpointOf(record);
+          if (wanted === (existing !== undefined)) return toAttributes(record);
+          if (existing?.id) {
+            const endpointId = existing.id;
+            yield* whenDatabaseReady(clients.rdb, region, databaseInstanceId, session,
+              clients.rdb.deleteEndpoint({ region, endpointId }).pipe(Effect.catchIf(isNotFound, () => Effect.void)));
+            yield* session.note(`Removed public endpoint ${endpointId} from Scaleway database instance ${databaseInstanceId}`);
+          } else if (wanted) {
+            const created = yield* whenDatabaseReady(clients.rdb, region, databaseInstanceId, session,
+              clients.rdb.createEndpoint({ region, instanceId: databaseInstanceId, endpointSpec: { load_balancer: {} } }));
+            yield* session.note(`Added public endpoint ${created.id} to Scaleway database instance ${databaseInstanceId}`);
           }
+          return toAttributes(yield* waitForDatabaseReady(clients.rdb, region, databaseInstanceId, session));
         });
+
+      const converge = (region: string, attributes: DatabaseInstance["Attributes"], props: DatabaseInstanceProps, session: Session) => {
+        const wanted = props.publicEndpoint ?? true;
+        return attributes.publicEndpoint === wanted
+          ? Effect.succeed(attributes)
+          : ensurePublicEndpoint(region, attributes.databaseInstanceId, wanted, session);
+      };
 
       const waitForDeleted = (output: DatabaseInstance["Attributes"], session: { note(message: string): Effect.Effect<void> }) =>
         Effect.gen(function* () {
@@ -219,7 +302,9 @@ export const DatabaseInstanceProvider = () =>
             !tagsEqual(olds.tags, news.tags) ||
             olds.disableBackup !== news.disableBackup ||
             !backupEqual(olds.backupSchedule, news.backupSchedule) ||
-            olds.backupSameRegion !== news.backupSameRegion
+            olds.backupSameRegion !== news.backupSameRegion ||
+            (olds.publicEndpoint ?? true) !== (news.publicEndpoint ?? true) ||
+            output.publicEndpoint !== undefined && output.publicEndpoint !== (news.publicEndpoint ?? true)
           ) {
             return { action: "update" } as const;
           }
@@ -251,9 +336,10 @@ export const DatabaseInstanceProvider = () =>
               ...updateInput(id, name, news),
             });
             yield* session.note(`Updated Scaleway database instance ${output.databaseInstanceId}`);
-            return updated.status?.toLowerCase() === "ready"
+            const ready = updated.status?.toLowerCase() === "ready"
               ? toAttributes(updated)
               : yield* waitForReady(output.databaseInstanceId, session);
+            return yield* converge(output.region, ready, news, session);
           }
 
           const found = yield* clients.rdb.listInstances({ region: clients.region, projectId: resolvedProjectId, name }).pipe(
@@ -276,7 +362,8 @@ export const DatabaseInstanceProvider = () =>
               ...updateInput(id, name, news),
             });
             yield* session.note(`Updated Scaleway database instance ${found.id}`);
-            return updated.status?.toLowerCase() === "ready" ? toAttributes(updated) : yield* waitForReady(found.id, session);
+            const ready = updated.status?.toLowerCase() === "ready" ? toAttributes(updated) : yield* waitForReady(found.id, session);
+            return yield* converge(clients.region, ready, news, session);
           }
 
           const created = yield* clients.rdb.createInstance({
@@ -305,8 +392,10 @@ export const DatabaseInstanceProvider = () =>
               })
             : undefined;
           yield* session.note(`Created Scaleway database instance ${created.id}`);
-          if (!current) return ready;
-          return current.status?.toLowerCase() === "ready" ? toAttributes(current) : yield* waitForReady(created.id, session);
+          const settled = !current
+            ? ready
+            : current.status?.toLowerCase() === "ready" ? toAttributes(current) : yield* waitForReady(created.id, session);
+          return yield* converge(clients.region, settled, news, session);
         }),
         delete: Effect.fnUntraced(function* ({ output, session }) {
           yield* deleteWhenAccepted(output.region, output.databaseInstanceId, session);
