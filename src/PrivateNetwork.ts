@@ -94,8 +94,7 @@ export const PrivateNetworkProvider = () =>
         diff: Effect.fnUntraced(function* ({ id, news, output }) {
           if (!isResolved(news) || !output) return undefined;
           if ((yield* projectId(projectInput(news), output.projectId)) !== output.projectId) return { action: "replace" } as const;
-          const desiredVpcId = yield* vpcIdOf(news.vpc);
-          if (desiredVpcId !== output.vpcId) return { action: "replace" } as const;
+          if (news.vpc !== undefined && (yield* vpcIdOf(news.vpc)) !== output.vpcId) return { action: "replace" } as const;
           const name = yield* nameOf(id, news.name);
           const tags = withAlchemyTag(id, news.tags);
           if (
