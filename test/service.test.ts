@@ -124,8 +124,10 @@ describe("Service", () => {
     Effect.gen(function* () {
       const first = yield* stack.deploy(deployService());
       expect(builds()).toHaveLength(1);
+      const firstDeployCalls = mock.calls.length;
 
       const second = yield* stack.deploy(deployService());
+      expect(mock.calls.slice(firstDeployCalls).filter((call) => call.method !== "GET").map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([]);
       expect(second.codeHash).toBe(first.codeHash);
       expect(second.containerId).toBe(first.containerId);
       expect(builds()).toHaveLength(1);
