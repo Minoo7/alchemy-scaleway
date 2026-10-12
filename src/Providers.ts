@@ -1,6 +1,7 @@
 import * as Layer from "effect/Layer";
 import { CredentialsStoreLive } from "alchemy/Auth/Credentials";
 import { ProfileStoreLive } from "alchemy/Auth/Profile";
+import { Random, RandomProvider } from "alchemy/Random";
 import * as Provider from "alchemy/Provider";
 import { ScalewayAuth } from "./AuthProvider.ts";
 import { Bucket, BucketProvider } from "./Bucket.ts";
@@ -26,6 +27,7 @@ import { PrivateNic, PrivateNicProvider } from "./PrivateNic.ts";
 import { PrivateNetwork, PrivateNetworkProvider } from "./PrivateNetwork.ts";
 import { Project, ProjectProvider } from "./Project.ts";
 import { RegistryNamespace, RegistryNamespaceProvider } from "./RegistryNamespace.ts";
+import { Service, ServiceProvider } from "./Service.ts";
 import { Secret, SecretProvider } from "./Secret.ts";
 import { SecurityGroup, SecurityGroupProvider } from "./SecurityGroup.ts";
 import { Trigger, TriggerProvider } from "./Trigger.ts";
@@ -47,6 +49,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
   Layer.effect(
     Providers,
     Provider.collection([
+      Random,
       Namespace,
       Project,
       Container,
@@ -75,10 +78,12 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
       FlexibleIp,
       InstanceKnownHosts,
       PrivateNic,
+      Service,
     ]),
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
+        RandomProvider(),
         NamespaceProvider(),
         ProjectProvider(),
         ContainerProvider(),
@@ -107,6 +112,7 @@ export const providers = (options: ScalewayProviderOptions = {}) =>
         FlexibleIpProvider(),
         InstanceKnownHostsProvider(),
         PrivateNicProvider(),
+        ServiceProvider(),
       ),
     ),
     Layer.provide(ScalewayClientsLive),

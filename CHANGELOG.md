@@ -6,13 +6,45 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 ### Added
 
+- `Service`: an Effect-native platform hosting a bundled program as a
+  Serverless Container, with init-time config and Outputs bound into its
+  (secret) environment, deployed through `Container`.
+  Like `Fly.Service`, its image comes from a generated Dockerfile built and
+  pushed with Alchemy's `Docker` service.
+  Env-only changes and secret rotation redeploy without rebuilding the image.
+- `smoke:scaleway:service`: an opt-in live smoke test for `Service`.
+- `Scaleway.providers()` registers Alchemy's `Random`, like the Cloudflare,
+  AWS, Fly and Railway provider bundles, so stacks can mint stable secrets.
+- Non-interactive profile configuration: `alchemy profile edit --add Scaleway
+  --method stored --set secretKey=env:SCW_SECRET_KEY ...` (and `--method env`),
+  with field validation before anything is written.
 - `DatabaseEndpoint` attaches a `DatabaseInstance` to a Private Network
   (IPAM by default, or a static `serviceIp`) and returns its private address.
 - `DatabaseInstance.publicEndpoint` removes or restores the public
   load-balancer endpoint, and the `publicEndpoint` output reports whether it exists.
 
+### Changed
+
+- The package now ships compiled JavaScript and declarations in `dist/`
+  (built on `prepack`), with a `bun` export condition for the raw sources.
+  Node consumers can import it, and consumers with stricter compiler options
+  no longer typecheck the package's sources.
+
 ### Fixed
 
+- `Scaleway.state()` now provides its own Scaleway API foundation
+  (credentials, clients, auth provider, profile and credential stores), so
+  `state: Scaleway.state()` works as documented, and it resolves credentials
+  on first use instead of while the stack loads.
+- `InstanceKnownHosts` imports `ssh2` through its default export so the
+  package loads under Node's ESM loader, which cannot name `utils` or
+  `Client` from the CommonJS module.
+- `InstanceKnownHosts` loads `ssh2` lazily, so importing the package does not
+  load `ssh2`'s optional native `cpu-features` binding.
+- Loading a stack's providers for a profile without Scaleway credentials no
+  longer fails with `Could not load auth providers`. Credential resolution now
+  surfaces Alchemy's `MissingProviderConfig` unwrapped, so `alchemy profile
+  edit --add Scaleway` works for a fresh profile.
 - `DatabaseInstance` public endpoint outputs now come from the load-balancer
   endpoint instead of the first endpoint, which could be a Private Network endpoint.
 - `Bucket` no longer rewrites its tags on every deploy. Its diff fell back

@@ -131,6 +131,7 @@ const notCovered: Record<string, string> = {
   ContainerImage: "builds through the injected Docker command runner",
   ContainerImageMirror: "copies through the injected registry copy engine",
   InstanceKnownHosts: "scans SSH host keys through the injected scanner",
+  Service: "builds through Alchemy's Docker service; test/service.test.ts asserts its unchanged redeploy writes nothing",
 };
 
 const exportedResources = Object.entries(Scaleway)

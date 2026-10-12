@@ -336,7 +336,8 @@ const sourceHash = (props: ContainerImageProps): Effect.Effect<string, Error, ne
     return `sha256:${hash.digest("hex")}`;
   });
 
-const registryPrefix = (registry: ContainerImageRegistryRef) =>
+/** The `rg.<region>.scw.cloud/<namespace>` prefix an image is pushed under. */
+export const registryPrefix = (registry: ContainerImageRegistryRef) =>
   typeof registry === "string" ? Effect.succeed(registry) : resolveRef(registry.imagePrefix);
 
 const imageRef = (registry: string, repository: string, tag: string) => `${registry}/${repository}:${tag}`;

@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Provider from "alchemy/Provider";
+import { Random, RandomProvider } from "alchemy/Random";
 import { Bucket, BucketProvider } from "../../src/Bucket.ts";
 import { Container, ContainerProvider } from "../../src/Container.ts";
 import { ContainerImage, ContainerImageProvider } from "../../src/ContainerImage.ts";
@@ -30,6 +31,7 @@ import { PrivateNetwork, PrivateNetworkProvider } from "../../src/PrivateNetwork
 import { Project, ProjectProvider } from "../../src/Project.ts";
 import { Providers } from "../../src/Providers.ts";
 import { RegistryNamespace, RegistryNamespaceProvider } from "../../src/RegistryNamespace.ts";
+import { Service, ServiceProvider } from "../../src/Service.ts";
 import { Secret, SecretProvider } from "../../src/Secret.ts";
 import { SecurityGroup, SecurityGroupProvider } from "../../src/SecurityGroup.ts";
 import { Trigger, TriggerProvider } from "../../src/Trigger.ts";
@@ -53,6 +55,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
   Layer.effect(
     Providers,
     Provider.collection([
+      Random,
       Namespace,
       Project,
       Container,
@@ -81,10 +84,12 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
       SecurityGroup,
       FlexibleIp,
       PrivateNic,
+      Service,
     ]),
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
+        RandomProvider(),
         NamespaceProvider(),
         ProjectProvider(),
         ContainerProvider(),
@@ -113,6 +118,7 @@ export const testProviders = (options: { project?: ProjectRef } = {}) =>
         SecurityGroupProvider(),
         FlexibleIpProvider(),
         PrivateNicProvider(),
+        ServiceProvider(),
       ),
     ),
     Layer.provide(ScalewayClientsLive),

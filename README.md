@@ -112,9 +112,10 @@ const program = Effect.gen(function* () {
 are effects. `ScalewayClientsLive` builds the client service from resolved
 credentials, while `fromAuthProvider()` supplies the credential service for a
 custom layer composition. Resource declarations and their resource props are
-unchanged. The package ships raw TypeScript and uses `.ts` import suffixes
-internally. Your `tsconfig.json` needs `"moduleResolution": "Bundler"` and
-`"allowImportingTsExtensions": true`.
+unchanged. The package ships compiled JavaScript with declarations in `dist/`;
+Bun resolves the raw TypeScript in `src/` through the `bun` export condition.
+Consumers no longer need `"allowImportingTsExtensions"` or to typecheck the
+package's sources under their own compiler settings.
 
 ## Credentials
 
@@ -129,6 +130,17 @@ SCW_API_URL=https://api.scaleway.com # optional, defaults to https://api.scalewa
 ```
 
 The `stored` auth method is configured through `alchemy profile edit --add Scaleway` and writes credentials under `~/.alchemy/credentials/{profile}/scaleway-stored.json`. Use `--reconfigure Scaleway` to refresh an existing stored account.
+
+Scripts and agents can configure a profile without prompts. `--set` takes `name=value`, `name=env:VAR` or `name=-` (stdin), so the secret stays out of shell history:
+
+```sh
+bun alchemy profile create ci-deploy
+bun alchemy profile edit --profile ci-deploy --add Scaleway --method stored \
+  --set secretKey=env:SCW_SECRET_KEY --set accessKey=env:SCW_ACCESS_KEY \
+  --set projectId=<project-id> --set region=fr-par
+```
+
+`--method stored` accepts `secretKey` (required), `accessKey`, `projectId`, `region` (defaults to `fr-par`) and `apiUrl`. `--method env` takes no fields and reads the `SCW_*` variables above at use time. With `CI=true`, Alchemy skips profiles and reads the environment directly.
 
 `Project` requires an explicit `organizationId` prop. The API key must have Account/Organization-level permissions to create, update, or delete Scaleway projects.
 
@@ -161,7 +173,15 @@ The DNS smoke test is also separate and does not run the full production smoke s
 SCW_LIVE_DNS_TEST=1 op run --environment <1password-environment-id> -- bun run smoke:scaleway:dns
 ```
 
-It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_SMOKE_DNS_ZONE`, optional `SCW_DNS_SMOKE_ZONE`, `SCW_DEFAULT_ZONE`, `SCW_API_URL`, `SCW_NEGATIVE_SMOKE_RUN_ID`, `SCW_NEGATIVE_SMOKE_STAGE`, `SCW_NEGATIVE_SMOKE_PREFIX`, and `SCW_NEGATIVE_SMOKE_REVERSE`.
+The `Service` smoke test deploys `scripts/smoke-service/main.ts` into a temporary container and registry namespace, fetches it until it answers with its bound secret and plain environment value, redeploys unchanged and checks the image did not change, then destroys the stack and fails on leaked containers.:
+
+```sh
+SCW_LIVE_SERVICE_TEST=1 op run --environment <1password-environment-id> -- bun run smoke:scaleway:service
+```
+
+It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, optional `SCW_DEFAULT_REGION`, `SCW_API_URL`, `SCW_SERVICE_SMOKE_RUN_ID`, `SCW_SERVICE_SMOKE_STAGE` and `SCW_SERVICE_SMOKE_PREFIX`.
+
+The DNS smoke test reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_SMOKE_DNS_ZONE`, optional `SCW_DNS_SMOKE_ZONE`, `SCW_DEFAULT_ZONE`, `SCW_API_URL`, `SCW_NEGATIVE_SMOKE_RUN_ID`, `SCW_NEGATIVE_SMOKE_STAGE`, `SCW_NEGATIVE_SMOKE_PREFIX`, and `SCW_NEGATIVE_SMOKE_REVERSE`.
 
 The database endpoint smoke test is separate and creates one `db-dev-s` PostgreSQL instance and two Private Networks. It deploys the database with `publicEndpoint: false` and an IPAM `DatabaseEndpoint`, redeploys unchanged, restores the public endpoint, then moves the endpoint to a second Private Network with a static `serviceIp`. After each deploy it checks the live Scaleway API, then destroys the stack and fails if the database or either network remains:
 
@@ -296,6 +316,8 @@ export default Alchemy.Stack(
 );
 ```
 
+`Scaleway.state()` brings its own Scaleway credentials, clients and auth provider, like `Cloudflare.state()`, and resolves credentials on first use. Use `objectStorageState()` to compose those layers yourself.
+
 Remote state requires `SCW_ACCESS_KEY` plus `SCW_SECRET_KEY`. `SCW_DEFAULT_PROJECT_ID` is used only to derive the default bucket name; the Object Storage credentials decide which project/account owns the bucket. Bucket names are globally unique, so pass `bucket` explicitly if the derived name is unavailable or if you want a shared state bucket. For multiple Scaleway projects, either use separate buckets or separate prefixes such as `alchemy/project-a` and `alchemy/project-b`. Do not run concurrent deploys against the same `bucket + prefix + stack + stage`; the Object Storage backend does not provide a distributed lock.
 
 ## Resources
@@ -305,6 +327,7 @@ Remote state requires `SCW_ACCESS_KEY` plus `SCW_SECRET_KEY`. `SCW_DEFAULT_PROJE
 - `Container` - Scaleway Serverless Container lifecycle with deployment readiness polling, optional custom domains, and optional cron triggers.
 - `ContainerImage` - Local Docker image build and push lifecycle for Scaleway Container Registry. It logs in with `SCW_SECRET_KEY`, runs `docker build`, runs `docker push`, returns content-tagged `ref` plus requested-tag `stableRef`, and can feed `Container.image` directly.
 - `ContainerImageMirror` - Copies an existing remote image (such as a private `ghcr.io` image) into a Scaleway Container Registry namespace using a built-in pure-TypeScript registry client (no external binary, no Docker daemon), preserving the multi-arch manifest. It resolves the source digest, pushes a content-derived `ref` plus a requested-tag `stableRef`, and exposes `ref`/`stableRef`/`digest` for `Container.image`.
+- `Service` - An Effect program hosted as a Serverless Container, the Scaleway counterpart of Alchemy's `Fly.Service` and `Railway.Service`. Like them, `main` is bundled with rolldown and Alchemy's Node bootstrap into a generated Dockerfile on `image` (default `node:24-slim`), with `build.install` packages (CommonJS drivers such as `pg`) installed by npm in the image and `extraFiles` copied next to the bundle. Alchemy's Docker service builds it for linux/amd64 and pushes it to the given `registry` with the Scaleway secret key, then the program is deployed through `Container`. Config and resource Outputs yielded in the program's init are bound into the container: Alchemy binds them as `Redacted`, so they travel as secret environment variables; plain `env` values stay plain. Unchanged programs and props skip the build and deploy; env-only changes and secret rotation redeploy the container with the already-pushed image. Requires a local Docker CLI with Buildx.
 - `Trigger` - Container trigger lifecycle (cron, SQS, or NATS source).
 - `Domain` - Container custom domain lifecycle. Set `waitForCname: true` when the stack also creates the CNAME and Scaleway should wait for DNS visibility before custom-domain creation.
 - `FunctionNamespace` - Scaleway Serverless Functions namespace lifecycle under the Functions v1beta1 API.
