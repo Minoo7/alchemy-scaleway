@@ -123,9 +123,7 @@ const cases: Record<string, () => Effect.Effect<unknown, never, Providers>> = {
     }),
 };
 
-const knownRedeployWrites: Record<string, string> = {
-  Secret: "diff returns update when nothing changed (8638b20, reason unrecorded); remove this entry when Secret noops",
-};
+const knownRedeployWrites: Record<string, string> = {};
 
 const notCovered: Record<string, string> = {
   ContainerImage: "builds through the injected Docker command runner",

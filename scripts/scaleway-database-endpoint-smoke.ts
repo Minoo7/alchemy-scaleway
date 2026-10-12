@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { connect, createServer, type AddressInfo, type Socket } from "node:net";
 import {
+  DATABASE_USER,
   databaseEndpointSmokeNames,
+  databaseEndpointSmokePassword,
   OTHER_SERVICE_IP,
   type DatabaseEndpointSmokePhase,
 } from "./scaleway-database-endpoint-smoke-stack.ts";
@@ -8,6 +11,7 @@ import {
 type Endpoint = {
   id: string;
   ip?: string;
+  port?: number;
   load_balancer?: object | null;
   private_network?: { private_network_id: string; service_ip?: string; provisioning_mode?: string } | null;
 };
@@ -84,6 +88,62 @@ async function findPrivateNetworks() {
   return found;
 }
 
+const proxyUrl = process.env.HTTPS_PROXY ?? process.env.https_proxy;
+
+function tunnelThroughProxy(client: Socket, host: string, port: number) {
+  const proxy = new URL(proxyUrl!);
+  const upstream = connect(Number(proxy.port), proxy.hostname, () => {
+    upstream.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
+  });
+  let header = Buffer.alloc(0);
+  const onHeader = (chunk: Buffer) => {
+    header = Buffer.concat([header, chunk]);
+    const end = header.indexOf("\r\n\r\n");
+    if (end === -1) return;
+    upstream.off("data", onHeader);
+    if (!header.subarray(0, header.indexOf("\r\n")).toString().includes(" 200 ")) {
+      client.destroy(new Error(`proxy refused CONNECT ${host}:${port}`));
+      upstream.destroy();
+      return;
+    }
+    const rest = header.subarray(end + 4);
+    if (rest.length > 0) client.write(rest);
+    client.pipe(upstream);
+    upstream.pipe(client);
+  };
+  upstream.on("data", onHeader);
+  upstream.on("error", (error) => client.destroy(error));
+  client.on("error", () => upstream.destroy());
+}
+
+async function databaseAddress(host: string, port: number) {
+  if (!proxyUrl) return { hostname: host, port, close: () => {} };
+  const server = createServer((client) => tunnelThroughProxy(client, host, port));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { hostname: "127.0.0.1", port: (server.address() as AddressInfo).port, close: () => server.close() };
+}
+
+async function withDatabase<T>(endpoint: Endpoint, run: (sql: InstanceType<typeof Bun.SQL>) => Promise<T>) {
+  if (!endpoint.ip || !endpoint.port) throw new Error(`public endpoint ${endpoint.id} has no address`);
+  const address = await databaseAddress(endpoint.ip, endpoint.port);
+  const sql = new Bun.SQL({
+    hostname: address.hostname,
+    port: address.port,
+    username: DATABASE_USER,
+    password: databaseEndpointSmokePassword(prefix),
+    database: "rdb",
+    tls: "require",
+    max: 1,
+    connectionTimeout: 30,
+  });
+  try {
+    return await run(sql);
+  } finally {
+    await sql.close();
+    address.close();
+  }
+}
+
 function check(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(`smoke check failed: ${message}`);
   console.log(`ok - ${message}`);
@@ -116,6 +176,11 @@ try {
   const privateEndpoint = first.privateEndpoints[0]!;
   check(privateEndpoint.private_network?.private_network_id === first.networks[names.lan], "endpoint is on the Lan network");
   check(privateEndpoint.private_network?.provisioning_mode === "ipam", "endpoint address comes from IPAM");
+  const acls = await scaleway<{ rules?: Array<{ ip: string; description?: string }> }>(
+    "GET",
+    `/rdb/v1/regions/${region}/instances/${first.instance.id}/acls`,
+  );
+  console.log(`observed default allowed IPs: ${JSON.stringify((acls.rules ?? []).map((rule) => rule.ip))}`);
 
   runAlchemy("deploy", "private", "private (unchanged)");
   const again = await observe();
@@ -126,6 +191,11 @@ try {
   const restored = await observe();
   check(restored.publicEndpoints.length === 1, "publicEndpoint: true restored the load-balancer endpoint");
   check(restored.privateEndpoints[0]?.id === privateEndpoint.id, "restoring the public endpoint keeps the private endpoint");
+  await withDatabase(restored.publicEndpoints[0]!, async (sql) => {
+    await sql`create table if not exists smoke_marker (value text not null)`;
+    await sql`insert into smoke_marker (value) values (${prefix})`;
+  });
+  console.log("wrote a marker row through the public endpoint (TLS without certificate verification)");
 
   runAlchemy("deploy", "moved", "moved");
   const moved = await observe();
@@ -136,6 +206,8 @@ try {
   check(movedEndpoint.private_network?.private_network_id === moved.networks[names.other], "endpoint moved to the Other network");
   check(movedEndpoint.private_network?.service_ip === OTHER_SERVICE_IP, "endpoint uses the static service IP");
   check(moved.publicEndpoints.length === 1, "the public endpoint survives the move");
+  const markers = await withDatabase(moved.publicEndpoints[0]!, (sql) => sql`select value from smoke_marker` as Promise<Array<{ value: string }>>);
+  check(markers.some((row) => row.value === prefix), "data written before the endpoint move is still there");
 } catch (error) {
   failure = error;
 } finally {
