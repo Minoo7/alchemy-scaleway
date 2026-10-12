@@ -9,7 +9,11 @@ export type DatabaseEndpointSmokePhase = "private" | "public" | "moved";
 const phase = (process.env.SCW_DATABASE_ENDPOINT_SMOKE_PHASE ?? "private") as DatabaseEndpointSmokePhase;
 const prefix = process.env.SCW_DATABASE_ENDPOINT_SMOKE_PREFIX ?? "alchemy-dbep-smoke";
 const tags = ["alchemy-smoke-test", `alchemy-dbep-smoke=${prefix}`];
-const password = Redacted.make(`AlchemySmokeDb1!${prefix.replace(/[^A-Za-z0-9]/g, "").slice(0, 32) || "default"}`);
+
+export const databaseEndpointSmokePassword = (smokePrefix: string) =>
+  `AlchemySmokeDb1!${smokePrefix.replace(/[^A-Za-z0-9]/g, "").slice(0, 32) || "default"}`;
+export const DATABASE_USER = "smoke";
+const password = Redacted.make(databaseEndpointSmokePassword(prefix));
 
 export const databaseEndpointSmokeNames = (smokePrefix: string) => ({
   database: `${smokePrefix}-db`,
@@ -36,7 +40,7 @@ export default Alchemy.Stack(
       name: names.database,
       engine: "PostgreSQL-16",
       nodeType: "db-dev-s",
-      userName: "smoke",
+      userName: DATABASE_USER,
       password,
       tags,
       publicEndpoint: phase !== "private",

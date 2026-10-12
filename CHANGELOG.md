@@ -15,6 +15,9 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 - `DatabaseInstance` public endpoint outputs now come from the load-balancer
   endpoint instead of the first endpoint, which could be a Private Network endpoint.
+- `Secret` no longer updates on every deploy. Its diff now returns noop when
+  nothing changed; Alchemy beta.80 records a removed `retain()` without an
+  update, which the always-update worked around.
 - `Bucket` no longer rewrites its tags on every deploy. Its diff fell back
   to Alchemy's props comparison, which always sees the managed-project
   default injected on first deploy as a change.

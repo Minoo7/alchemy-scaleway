@@ -182,7 +182,7 @@ export const SecretProvider = () =>
           ) {
             return { action: "update" } as const;
           }
-          return { action: "update" } as const;
+          return { action: "noop" } as const;
         }),
         read: Effect.fnUntraced(function* ({ output }) {
           if (!output?.secretId) return undefined;
