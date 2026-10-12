@@ -18,6 +18,10 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 - Non-interactive profile configuration: `alchemy profile edit --add Scaleway
   --method stored --set secretKey=env:SCW_SECRET_KEY ...` (and `--method env`),
   with field validation before anything is written.
+- `DatabaseEndpoint` attaches a `DatabaseInstance` to a Private Network
+  (IPAM by default, or a static `serviceIp`) and returns its private address.
+- `DatabaseInstance.publicEndpoint` removes or restores the public
+  load-balancer endpoint, and the `publicEndpoint` output reports whether it exists.
 
 ### Changed
 
@@ -41,6 +45,14 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
   longer fails with `Could not load auth providers`. Credential resolution now
   surfaces Alchemy's `MissingProviderConfig` unwrapped, so `alchemy profile
   edit --add Scaleway` works for a fresh profile.
+- `DatabaseInstance` public endpoint outputs now come from the load-balancer
+  endpoint instead of the first endpoint, which could be a Private Network endpoint.
+- `Bucket` no longer rewrites its tags on every deploy. Its diff fell back
+  to Alchemy's props comparison, which always sees the managed-project
+  default injected on first deploy as a change.
+- `PrivateNetwork` without `vpc` no longer plans a replacement on every
+  deploy. Scaleway places it in the project's default VPC, and an unset `vpc`
+  now accepts that VPC instead of comparing it with `undefined`.
 
 ## [0.8.0-beta.80] - 2026-10-03
 

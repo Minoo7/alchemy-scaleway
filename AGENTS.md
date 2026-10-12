@@ -64,7 +64,8 @@ Current resources:
 - `DnsRecord` - Scaleway Domains and DNS record set with resource target support.
 - `RegistryNamespace` - Scaleway Container Registry namespace.
 - `Secret` - Scaleway Secret Manager secret and value version lifecycle.
-- `DatabaseInstance` - Scaleway Managed Database for PostgreSQL/MySQL instance lifecycle with redacted admin password input.
+- `DatabaseInstance` - Scaleway Managed Database for PostgreSQL/MySQL instance lifecycle with redacted admin password input and an optional public endpoint (`publicEndpoint`).
+- `DatabaseEndpoint` - Private Network endpoint on a `DatabaseInstance`; replaced delete-first because Scaleway allows one per instance, and reported `Unowned` when found without state because endpoints carry no ownership metadata.
 - `Bucket` - Scaleway Object Storage bucket via S3-compatible API.
 - `Vpc` - Scaleway VPC lifecycle with one-way routing and custom route propagation enablement.
 - `PrivateNetwork` - Scaleway Private Network with optional VPC binding, subnets, DHCP, and default route propagation.
@@ -104,6 +105,7 @@ The CRAP script supports `// @crap-ignore` only for wrapper/factory functions th
 - Keep Object Storage S3-compatible behavior separate from Containers REST behavior.
 - Keep readiness polling behavior internal to resource reconciliation.
 - Preserve clear update-vs-replace rules in each resource's `diff` implementation.
+- An unchanged redeploy must make no write calls. `test/redeploy-noop.test.ts` deploys every exported resource twice and fails if one is missing a case; `knownRedeployWrites` lists the exceptions and may only shrink. End `diff` with an explicit `{ action: "noop" }`: falling through to `undefined` lets Alchemy compare props, and `withManagedProjectDefault` props differ after the first deploy. When Scaleway fills in a field you left unset (such as a Private Network's default VPC), make the mock fill it in too, and do not compare the unset prop against it.
 - Do not introduce nested package layout or old `create/update/delete` provider methods.
 - Track the current Alchemy v2 limitation: `ResourceOptions` lack `alwaysUpdate`/read-on-noop. Same-props deploys cannot detect external deletion of `Container`-managed companion domains/triggers or `Function`-managed companion domains/crons; revisit when Alchemy exposes an equivalent option.
 

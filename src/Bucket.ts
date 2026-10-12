@@ -70,7 +70,7 @@ export const BucketProvider = () =>
             return { action: "replace" } as const;
           if (!hasAlchemyTags(id, output.tags) || olds.versioning !== news.versioning || !recordEquals(olds.tags, news.tags))
             return { action: "update" } as const;
-          return undefined;
+          return { action: "noop" } as const;
         }),
         read: Effect.fnUntraced(function* ({ id, olds, output }) {
           const name = output?.bucketName ?? (yield* nameOf(id, olds?.name));

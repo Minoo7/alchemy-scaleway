@@ -25,6 +25,8 @@ export interface ScalewayMock {
   makeDatabaseDeleteStaleInList(reads: number): void;
   /** Mark owned RDB instances in a project as deleting and stale in project listings. */
   markProjectDatabasesDeleting(projectId: string, reads: number): void;
+  /** Put an RDB instance into a transient status (such as `backuping`) for the next `reads` instance reads. */
+  setDatabaseStatus(instanceId: string, status: string, reads: number): void;
   removeVpc(id: string): void;
   removePrivateNetwork(id: string): void;
   removeRoute(id: string): void;
@@ -869,9 +871,75 @@ export function installScalewayMock(): ScalewayMock {
       return json({ instances: page.items, total_count: page.total_count });
     }
 
+    const endpointsOf = (instance: Record<string, unknown>) => (instance.endpoints ?? []) as Array<Record<string, unknown>>;
+    const withEndpoints = (instance: Record<string, unknown>, endpoints: Array<Record<string, unknown>>) => ({
+      ...instance,
+      endpoints,
+      endpoint: endpoints[0] ?? null,
+      ...(asyncLifecycle ? { status: "configuring", __readyReads: 0 } : {}),
+    });
+    const busy = (instance: Record<string, unknown>) => instance.status !== "ready";
+    const transient = () => json({ message: "resource is in a transient state", type: "transient_state" }, 409);
+    const owningInstance = (endpointId: string) =>
+      [...databaseInstances.values()].find((instance) => endpointsOf(instance).some((endpoint) => endpoint.id === endpointId));
+
+    if (kind === "endpoints" && id) {
+      const instance = owningInstance(id);
+      const endpoint = instance && endpointsOf(instance).find((candidate) => candidate.id === id);
+      if (!instance || !endpoint) return json({ message: "endpoint not found", type: "not_found" }, 404);
+      if (method === "GET") return json(endpoint);
+      if (method === "DELETE") {
+        if (busy(instance)) return transient();
+        databaseInstances.set(instance.id as string, withEndpoints(instance, endpointsOf(instance).filter((candidate) => candidate.id !== id)));
+        return noContent();
+      }
+    }
+
+    if (kind === "instances" && id && segments[6] === "endpoints" && method === "POST") {
+      const instance = databaseInstances.get(id);
+      if (!instance) return json({ message: "database instance not found", type: "not_found" }, 404);
+      if (busy(instance)) return transient();
+      const spec = (input.endpoint_spec ?? {}) as Record<string, Record<string, unknown> | undefined>;
+      const endpoints = endpointsOf(instance);
+      let endpoint: Record<string, unknown>;
+      if (spec.load_balancer) {
+        if (endpoints.some((candidate) => candidate.load_balancer)) {
+          return json({ message: "invalid argument(s)", details: [{ argument_name: "endpoint_spec", help_message: "only one load balancer endpoint is allowed" }] }, 400);
+        }
+        endpoint = { id: nextId("rdbep"), ip: `198.51.100.${counter + 1}`, port: 5432, name: null, load_balancer: {} };
+      } else if (spec.private_network) {
+        const privateNetworkId = String(spec.private_network.private_network_id);
+        if (!privateNetworks.has(privateNetworkId)) {
+          return json({ message: "resource is not found", resource: "private_network", resource_id: privateNetworkId, type: "not_found" }, 404);
+        }
+        if (endpoints.some((candidate) => candidate.private_network)) {
+          return json({ message: "invalid argument(s)", details: [{ argument_name: "endpoint_spec", help_message: "only one private network endpoint is allowed" }] }, 400);
+        }
+        const serviceIp = spec.private_network.service_ip as string | undefined;
+        const ip = serviceIp ? serviceIp.split("/")[0] : `172.16.0.${counter + 1}`;
+        endpoint = {
+          id: nextId("rdbep"),
+          ip,
+          port: 5432,
+          name: null,
+          ...(serviceIp ? {} : { hostname: `${instance.name}.${privateNetworkId}.internal` }),
+          private_network: {
+            private_network_id: privateNetworkId,
+            service_ip: serviceIp ?? `${ip}/22`,
+            zone: "fr-par-1",
+            provisioning_mode: serviceIp ? "static" : "ipam",
+          },
+        };
+      } else {
+        return json({ message: "invalid argument(s)", details: [{ argument_name: "endpoint_spec", help_message: "required" }] }, 400);
+      }
+      databaseInstances.set(id, withEndpoints(instance, [...endpoints, endpoint]));
+      return json(endpoint);
+    }
+
     if (kind === "instances" && !id && method === "POST") {
       const hostname = `db-${counter + 1}.rdb.fr-par.scw.cloud`;
-      const endpoint = { ip: `198.51.100.${counter + 1}`, port: 5432, hostname };
+      const endpoint = { id: nextId("rdbep"), ip: `198.51.100.${counter + 1}`, port: 5432, hostname, name: null, load_balancer: {} };
       const record = {
         id: nextId("rdb"),
         region: "fr-par",
@@ -895,7 +963,15 @@ export function installScalewayMock(): ScalewayMock {
       if (!existing) return json({ message: "database instance not found" }, 404);
       if (method === "GET") {
         if (existing.__staleListReads !== undefined) return json({ message: "database instance not found" }, 404);
-        if (asyncLifecycle && existing.status === "initializing") {
+        if (existing.__transientReads !== undefined) {
+          const remaining = Number(existing.__transientReads);
+          const updated = remaining > 0
+            ? { ...existing, __transientReads: remaining - 1 }
+            : { ...existing, status: "ready", __transientReads: undefined };
+          databaseInstances.set(id, updated);
+          return json(updated);
+        }
+        if (asyncLifecycle && (existing.status === "initializing" || existing.status === "configuring")) {
           const readyReads = Number(existing.__readyReads ?? 0);
           if (readyReads > 0) {
             const updated = { ...existing, __readyReads: readyReads - 1 };
@@ -1075,9 +1151,19 @@ export function installScalewayMock(): ScalewayMock {
           subnets: [],
           dhcp_enabled: false,
           ...input,
+          vpc_id: input.vpc_id ?? "vpc-default-fr-par",
         };
         privateNetworks.set(record.id as string, record);
         return json({ private_network: record });
+      }
+      if (!id && method === "GET") {
+        const params = new URLSearchParams(search);
+        const matching = [...privateNetworks.values()].filter((network) =>
+          (!params.get("name") || network.name === params.get("name")) &&
+          (!params.get("project_id") || network.project_id === params.get("project_id"))
+        );
+        const page = pageOf(matching, params);
+        return json({ private_networks: page.items, total_count: page.total_count });
       }
       const existing = privateNetworks.get(id);
       if (!existing) return json({ message: "private network not found" }, 404);
@@ -1638,6 +1724,10 @@ export function installScalewayMock(): ScalewayMock {
     },
     makeDatabaseDeleteStaleInList: (reads) => {
       staleRdbListReads = reads;
+    },
+    setDatabaseStatus: (instanceId, status, reads) => {
+      const existing = databaseInstances.get(instanceId);
+      if (existing) databaseInstances.set(instanceId, { ...existing, status, __transientReads: reads });
     },
     markProjectDatabasesDeleting: (projectId, reads) => {
       for (const [id, instance] of databaseInstances) {

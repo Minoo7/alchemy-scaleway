@@ -67,6 +67,14 @@ export {
   type DatabaseInstanceProps,
   type DatabaseVolumeType,
 } from "./DatabaseInstance.ts";
+export {
+  DatabaseEndpoint,
+  DatabaseEndpointConflict,
+  DatabaseEndpointProvider,
+  type DatabaseEndpointInstanceRef,
+  type DatabaseEndpointPrivateNetworkRef,
+  type DatabaseEndpointProps,
+} from "./DatabaseEndpoint.ts";
 export { Domain, DomainProvider, type DomainContainerRef, type DomainProps } from "./Domain.ts";
 export {
   DnsRecord,
