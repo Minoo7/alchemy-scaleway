@@ -15,6 +15,9 @@ All notable changes to `@bjorntech/alchemy-scaleway` are documented here. The pa
 
 - `DatabaseInstance` public endpoint outputs now come from the load-balancer
   endpoint instead of the first endpoint, which could be a Private Network endpoint.
+- `PrivateNetwork` without `vpc` no longer plans a replacement on every
+  deploy. Scaleway places it in the project's default VPC, and an unset `vpc`
+  now accepts that VPC instead of comparing it with `undefined`.
 
 ## [0.8.0-beta.80] - 2026-10-03
 

@@ -1151,6 +1151,7 @@ export function installScalewayMock(): ScalewayMock {
           subnets: [],
           dhcp_enabled: false,
           ...input,
+          vpc_id: input.vpc_id ?? "vpc-default-fr-par",
         };
         privateNetworks.set(record.id as string, record);
         return json({ private_network: record });
