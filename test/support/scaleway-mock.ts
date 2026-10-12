@@ -1155,6 +1155,15 @@ export function installScalewayMock(): ScalewayMock {
         privateNetworks.set(record.id as string, record);
         return json({ private_network: record });
       }
+      if (!id && method === "GET") {
+        const params = new URLSearchParams(search);
+        const matching = [...privateNetworks.values()].filter((network) =>
+          (!params.get("name") || network.name === params.get("name")) &&
+          (!params.get("project_id") || network.project_id === params.get("project_id"))
+        );
+        const page = pageOf(matching, params);
+        return json({ private_networks: page.items, total_count: page.total_count });
+      }
       const existing = privateNetworks.get(id);
       if (!existing) return json({ message: "private network not found" }, 404);
       if (!action && method === "GET") return json({ private_network: existing });

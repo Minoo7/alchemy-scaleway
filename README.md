@@ -163,6 +163,14 @@ SCW_LIVE_DNS_TEST=1 op run --environment <1password-environment-id> -- bun run s
 
 It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_SMOKE_DNS_ZONE`, optional `SCW_DNS_SMOKE_ZONE`, `SCW_DEFAULT_ZONE`, `SCW_API_URL`, `SCW_NEGATIVE_SMOKE_RUN_ID`, `SCW_NEGATIVE_SMOKE_STAGE`, `SCW_NEGATIVE_SMOKE_PREFIX`, and `SCW_NEGATIVE_SMOKE_REVERSE`.
 
+The database endpoint smoke test is separate and creates one `db-dev-s` PostgreSQL instance and two Private Networks. It deploys the database with `publicEndpoint: false` and an IPAM `DatabaseEndpoint`, redeploys unchanged, restores the public endpoint, then moves the endpoint to a second Private Network with a static `serviceIp`. After each deploy it checks the live Scaleway API, then destroys the stack and fails if the database or either network remains:
+
+```sh
+SCW_LIVE_DATABASE_ENDPOINT_TEST=1 op run --environment <1password-environment-id> -- bun run smoke:scaleway:database-endpoint
+```
+
+It reads `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_REGION`, `SCW_API_URL`, and optional `SCW_DATABASE_ENDPOINT_SMOKE_RUN_ID`, `SCW_DATABASE_ENDPOINT_SMOKE_STAGE`, and `SCW_DATABASE_ENDPOINT_SMOKE_PREFIX`; rerun with the same run ID to clean up an interrupted run.
+
 ## Usage
 
 ```ts

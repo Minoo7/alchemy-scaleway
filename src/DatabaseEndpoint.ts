@@ -127,7 +127,7 @@ export const DatabaseEndpointProvider = () =>
           ) {
             return { action: "replace", deleteFirst: true } as const;
           }
-          return undefined;
+          return { action: "noop" } as const;
         }),
         read: Effect.fnUntraced(function* ({ olds, output }) {
           if (output?.endpointId) {

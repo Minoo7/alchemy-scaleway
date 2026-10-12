@@ -262,7 +262,11 @@ describe("DatabaseInstance publicEndpoint", () => {
       expect(created.db.endpointPort).toBeUndefined();
       expect(endpointDeletes()).toHaveLength(1);
 
+      const endpointReads = () => requests("GET", new RegExp(`^/rdb/v1/regions/fr-par/endpoints/${created.endpoint.endpointId}$`)).length;
+      const readsBefore = endpointReads();
       const restored = yield* stack.deploy(privateDatabase({ publicEndpoint: true }));
+
+      expect(endpointReads()).toBe(readsBefore);
 
       expect(restored.db.publicEndpoint).toBe(true);
       expect(restored.db.endpointIp).toMatch(/^198\.51\.100\./);
